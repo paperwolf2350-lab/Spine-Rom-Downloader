@@ -6,12 +6,15 @@ import re
 import tempfile
 import threading
 import tkinter as tk
+import traceback
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from functools import lru_cache
 from html.parser import HTMLParser
+from itertools import chain
+from operator import itemgetter
 from http.cookies import CookieError, SimpleCookie
 from pathlib import Path, PurePosixPath
 from queue import Empty, SimpleQueue
@@ -219,6 +222,22 @@ class Rom:
     archive_member: bool = False
 
 
+def rom_from(entry):
+    """Build a Rom from saved data, or return None if the data is unusable."""
+    if not isinstance(entry, dict):
+        return None
+    try:
+        rom = Rom(**{key: entry[key] for key in Rom.__dataclass_fields__ if key in entry})
+    except TypeError:
+        return None
+    texts = (rom.name, rom.collection, rom.url, rom.sha1, rom.source)
+    if not all(isinstance(text, str) for text in texts) or not rom.name or not rom.url:
+        return None
+    if not isinstance(rom.size, int) or isinstance(rom.size, bool):
+        return None
+    return rom
+
+
 @lru_cache(maxsize=16)
 def metadata(identifier):
     return json.loads(read(f"{ARCHIVE}/metadata/{quote(identifier)}", "archive"))
@@ -393,10 +412,104 @@ def download(rom, destination, progress, archive_cookie='', cancel=None):
                 partial.unlink(missing_ok=True)
 
 
-def load_state(filename, default):
+STATE_NOTES = []
+JOB_STATUSES = {
+    "Queued", "Downloading", "Canceling", "Completed", "Failed", "Canceled", "Interrupted",
+}
+
+
+def log_problem(text):
+    """Add a problem report to errors.log. Never raises."""
     try:
-        return json.loads((STATE_PATH / filename).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        STATE_PATH.mkdir(parents=True, exist_ok=True)
+        with open(STATE_PATH / "errors.log", "a", encoding="utf-8") as output:
+            stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+            output.write(f"[{stamp}]\n{text.rstrip()}\n\n")
+    except OSError:
+        pass
+
+
+def whole_number(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def clean_catalog(raw):
+    if not isinstance(raw, dict):
+        raise ValueError("The saved catalog has an unexpected layout.")
+    catalog = {}
+    for label, entry in raw.items():
+        if not isinstance(entry, dict):
+            continue
+        items = entry.get("items")
+        items = items if isinstance(items, dict) else {}
+        errors = entry.get("errors")
+        checked = entry.get("checked")
+        try:
+            datetime.fromisoformat(checked)
+        except (TypeError, ValueError):
+            checked = ""
+        catalog[label] = {
+            "items": {
+                identifier: {url: rom for url, rom in files.items() if isinstance(rom, dict)}
+                for identifier, files in items.items() if isinstance(files, dict)
+            },
+            "errors": [str(error) for error in errors] if isinstance(errors, list) else [],
+            "read": whole_number(entry.get("read")),
+            "total": whole_number(entry.get("total")),
+            "checked": checked,
+        }
+    return catalog
+
+
+def clean_settings(raw):
+    if not isinstance(raw, dict):
+        raise ValueError("The saved settings have an unexpected layout.")
+    return {key: value for key, value in raw.items() if isinstance(value, str)}
+
+
+def clean_jobs(raw):
+    if not isinstance(raw, list):
+        raise ValueError("The saved download history has an unexpected layout.")
+    jobs = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        rom = rom_from(item.get("rom"))
+        destination = item.get("destination")
+        status = item.get("status")
+        if rom is None or not isinstance(destination, str) or not destination or status not in JOB_STATUSES:
+            continue
+        detail, saved_path = item.get("detail"), item.get("saved_path")
+        jobs.append(DownloadJob(
+            rom, destination, item.get("choose_filename") is True, status,
+            detail if isinstance(detail, str) else "",
+            saved_path if isinstance(saved_path, str) else "",
+        ))
+    return jobs
+
+
+def load_state(filename, default, clean):
+    """Read a saved file. A damaged one is set aside and the default is used."""
+    path = STATE_PATH / filename
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return default
+    except (OSError, ValueError) as exc:
+        STATE_NOTES.append(f"{filename} could not be read ({exc}).")
+        log_problem(f"Could not read {path}: {exc}")
+        return default
+    try:
+        return clean(json.loads(text))
+    except Exception as exc:
+        kept = path.with_name(filename + ".damaged")
+        try:
+            path.replace(kept)
+            note = f"{filename} was damaged or from an incompatible version. A copy was kept as {kept.name}."
+        except OSError:
+            note = f"{filename} was damaged or from an incompatible version."
+        STATE_NOTES.append(note)
+        log_problem(f"Could not use {path}: {exc!r}")
         return default
 
 
@@ -493,7 +606,7 @@ def apply_theme(window):
 
 LIBRARY_PLATFORMS = {
     "Arcade": "arcade", "Dreamcast": "dreamcast", "Game Boy Advance": "gba",
-    "Neo Geo": "neogeo", "Nintendo 3DS": "n3ds", "Nintendo 64": "n64",
+    "Mega Drive - Genesis": "megadrive", "Neo Geo": "neogeo", "Nintendo 3DS": "n3ds", "Nintendo 64": "n64",
     "Nintendo DS": "nds", "Nintendo GameCube": "gc", "Nintendo Switch": "switch",
     "Nintendo Wii": "wii", "Nintendo Wii U": "wiiu", "PlayStation": "psx",
     "PlayStation 2": "ps2", "PlayStation 3": "ps3", "PlayStation 4": "ps4",
@@ -509,20 +622,79 @@ LIBRARY_EXTENSIONS = {
 }
 
 
+# Other folder names people commonly use for the same console.
+LIBRARY_FOLDER_NAMES = {
+    "psx": ("psx", "ps1", "playstation"), "psvita": ("psvita", "vita"),
+    "gc": ("gc", "gamecube", "ngc"), "n3ds": ("n3ds", "3ds"), "nds": ("nds", "ds"),
+    "snes": ("snes", "sfc"), "nes": ("nes", "famicom"),
+    "megadrive": ("megadrive", "genesis"), "mastersystem": ("mastersystem", "sms"),
+    "gamegear": ("gamegear", "gg"), "sega32x": ("sega32x", "32x"),
+    "segacd": ("segacd", "megacd"), "pcengine": ("pcengine", "tg16", "pce"),
+    "arcade": ("arcade", "mame", "fbneo"),
+}
+# Console names as they appear in Internet Archive folder and collection names.
+# Order matters: the more specific name comes first.
+LIBRARY_KEYWORDS = [(re.compile(pattern), console) for pattern, console in (
+    (r"playstation ?portable|\bpsp\b", "psp"),
+    (r"playstation ?vita|\bps ?vita\b", "psvita"),
+    (r"playstation ?2\b|\bps2\b", "ps2"), (r"playstation ?3\b|\bps3\b", "ps3"),
+    (r"playstation ?4\b|\bps4\b", "ps4"), (r"playstation ?5\b|\bps5\b", "ps5"),
+    (r"playstation|\bpsx\b|\bps1\b", "psx"),
+    (r"xbox ?360|\bx360\b", "xbox360"), (r"\bxbox\b", "xbox"),
+    (r"game ?boy ?advance|\bgba\b", "gba"), (r"game ?boy ?color|\bgbc\b", "gbc"),
+    (r"game ?boy\b", "gb"),
+    (r"game ?cube|\bngc\b", "gc"), (r"wii ?u\b", "wiiu"), (r"\bwii\b", "wii"),
+    (r"nintendo ?64|\bn64\b", "n64"), (r"nintendo ?3ds|\b3ds\b", "n3ds"),
+    (r"nintendo ?dsi?\b|\bnds\b", "nds"), (r"nintendo ?switch", "switch"),
+    (r"super ?nintendo|super ?famicom|\bsnes\b", "snes"),
+    (r"nintendo ?entertainment ?system|famicom|\bnes\b", "nes"),
+    (r"dreamcast", "dreamcast"), (r"saturn", "saturn"),
+    (r"mega ?cd|sega ?cd", "segacd"), (r"\b32x\b", "sega32x"),
+    (r"mega ?drive|genesis", "megadrive"), (r"master ?system", "mastersystem"),
+    (r"game ?gear", "gamegear"), (r"neo ?geo", "neogeo"),
+    (r"pc ?engine|turbo ?grafx", "pcengine"),
+    (r"atari ?2600", "atari2600"), (r"atari ?5200", "atari5200"), (r"atari ?7800", "atari7800"),
+    (r"\bmame\b|\bfbneo\b|final ?burn|arcade", "arcade"),
+)]
+
+
+def archive_console(rom):
+    """Work out the console from where a file sits on Internet Archive.
+
+    The file's own name is left out, because game titles often contain
+    console words ("Arcade Classics", "Genesis Collection").
+    """
+    match = re.match(r"/download/([^/]+)/(.*)", unquote(urlsplit(rom.url).path))
+    if not match:
+        return None
+    path = match[2]
+    marker = path.lower().find(".zip/") if rom.archive_member else -1
+    folders = path[:marker + 4] if marker >= 0 else path.rpartition("/")[0]
+    for text in (folders, match[1], rom.collection):
+        text = re.sub(r"[^a-z0-9]+", " ", text.lower())
+        for pattern, console in LIBRARY_KEYWORDS:
+            if pattern.search(text):
+                return console
+    return None
+
+
 def library_destination(root, rom):
     if rom.source == "BlueRoms":
-        folder = LIBRARY_PLATFORMS.get(rom.collection)
-        if rom.collection == "Mega Drive - Genesis":
-            matches = [name for name in ("megadrive", "genesis") if (root / name).is_dir()]
-            folder = matches[0] if len(matches) == 1 else None
+        console = LIBRARY_PLATFORMS.get(rom.collection)
     else:
-        folder = LIBRARY_EXTENSIONS.get(PurePosixPath(rom.name).suffix.lower())
-        if rom.archive_member and rom.collection == ZIP_SCOPE:
-            folder = "gb"
-    if folder:
-        candidate = root / folder
-        if candidate.is_dir() and candidate.resolve().is_relative_to(root.resolve()):
-            return candidate
+        console = (LIBRARY_EXTENSIONS.get(PurePosixPath(rom.name).suffix.lower())
+                   or archive_console(rom))
+    if console:
+        try:
+            base = root.resolve()
+            found = [
+                folder for folder in (root / name for name in LIBRARY_FOLDER_NAMES.get(console, (console,)))
+                if folder.is_dir() and folder.resolve().is_relative_to(base)
+            ]
+        except OSError:
+            found = []
+        if len(found) == 1:
+            return found[0]
     return root
 
 
@@ -544,15 +716,14 @@ class App(tk.Tk):
         self.geometry("1000x670")
         self.minsize(690, 440)
         self.events = SimpleQueue()
-        self.catalog = load_state("catalog.json", {})
-        self.settings = load_state("settings.json", {})
+        self.catalog = load_state("catalog.json", {}, clean_catalog)
+        self.settings = load_state("settings.json", {}, clean_settings)
         self.index = []
+        self.category_rows = {}
+        self.rebuild_timer = None
         self.coverage = ""
         self.rows = {}
-        self.jobs = [
-            DownloadJob(rom=Rom(**item["rom"]), **{key: value for key, value in item.items() if key != "rom"})
-            for item in load_state("downloads.json", [])
-        ]
+        self.jobs = load_state("downloads.json", [], clean_jobs)
         for job in self.jobs:
             if job.status in {"Queued", "Downloading", "Canceling"}:
                 job.status = "Interrupted"
@@ -637,13 +808,32 @@ class App(tk.Tk):
         self.enable_download()
         self.event_timer = self.after(80, self.process_events)
         self.select_category()
+        if STATE_NOTES:
+            self.after(300, self.show_state_notes)
         if not self.catalog:
             self.reload()
+
+    def show_state_notes(self):
+        notes = "\n\n".join(STATE_NOTES)
+        STATE_NOTES.clear()
+        messagebox.showwarning(
+            "Saved data", f"Spine started fresh where it could not use its saved data.\n\n{notes}",
+            parent=self,
+        )
+
+    def report_callback_exception(self, exc, value, trace):
+        log_problem("".join(traceback.format_exception(exc, value, trace)))
+        try:
+            self.sync_status.set(f"Something went wrong • details saved to {STATE_PATH / 'errors.log'}")
+        except Exception:
+            pass
 
     def destroy(self):
         if self.cancel_transfer:
             self.cancel_transfer.set()
         self.after_cancel(self.event_timer)
+        if self.rebuild_timer is not None:
+            self.after_cancel(self.rebuild_timer)
         super().destroy()
 
     def background(self, job, success, error, *, daemon=True):
@@ -652,6 +842,8 @@ class App(tk.Tk):
                 result = job()
                 self.events.put((success, result))
             except Exception as exc:
+                if not isinstance(exc, (OSError, ValueError, DownloadCanceled)):
+                    log_problem(traceback.format_exc())
                 self.events.put((error, str(exc)))
         threading.Thread(target=run, daemon=daemon).start()
 
@@ -756,36 +948,75 @@ class App(tk.Tk):
         def finish(status):
             self.refresh.configure(state="normal")
             self.sync_status.set(status)
+            if self.rebuild_timer is not None:
+                self.rebuild_index(keep_view=True)
 
         self.background(scan, finish, lambda error: finish(f"Refresh failed • {error}"))
 
     def update_catalog(self, update):
+        """Take in one refreshed category without rebuilding the whole list."""
         label, entry = update
+        self.category_rows.pop(label, None)
         if entry is None:
             self.catalog.pop(label, None)
         else:
             self.catalog[label] = entry
-        self.select_category()
+        selected = self.category.get()
+        self.list_categories()
+        if selected == label or self.category.get() != selected:
+            self.rebuild_index(keep_view=True)
+        elif selected == ALL_PLATFORMS and self.rebuild_timer is None:
+            # Many categories arrive in a row during a refresh: update the
+            # combined list every few seconds instead of once per category.
+            self.rebuild_timer = self.after(4000, lambda: self.rebuild_index(keep_view=True))
 
-    def select_category(self):
+    def list_categories(self):
         values = [ALL_PLATFORMS, *sorted(self.catalog)]
         self.combo.configure(values=values)
         if self.category.get() not in values:
             self.category.set(ALL_PLATFORMS)
-        selected = self.category.get()
-        entries = self.catalog.values() if selected == ALL_PLATFORMS else [self.catalog[selected]]
-        unique = {}
-        for entry in entries:
-            for files in entry.get("items", {}).values():
+
+    def select_category(self):
+        self.list_categories()
+        self.rebuild_index()
+
+    def rows_for(self, label):
+        """One category's files, sorted and ready to search. Kept until it changes."""
+        rows = self.category_rows.get(label)
+        if rows is None:
+            unique = {}
+            for files in self.catalog[label].get("items", {}).values():
                 unique.update(files)
-        self.index = sorted(
-            (Rom(**entry) for entry in unique.values()),
-            key=lambda rom: (rom.name.casefold(), rom.url),
-        )
-        self.coverage = f"{len(self.catalog)} categories checked" if selected == ALL_PLATFORMS else (
-            f"{self.catalog[selected]['read']}/{self.catalog[selected]['total']} listings read on last refresh"
-        )
-        self.render()
+            rows = []
+            for entry in unique.values():
+                rom = rom_from(entry)
+                if rom is not None:
+                    rows.append((rom.name.casefold(), rom.url, rom,
+                                 f"{rom.name} {rom.collection} {rom.source}".casefold()))
+            rows.sort(key=itemgetter(0, 1))
+            self.category_rows[label] = rows
+        return rows
+
+    def rebuild_index(self, keep_view=False):
+        if self.rebuild_timer is not None:
+            self.after_cancel(self.rebuild_timer)
+            self.rebuild_timer = None
+        selected = self.category.get()
+        if selected == ALL_PLATFORMS:
+            merged = sorted(chain.from_iterable(self.rows_for(label) for label in self.catalog),
+                            key=itemgetter(0, 1))
+            self.index = []
+            previous = None
+            for row in merged:
+                if row[1] != previous:
+                    self.index.append(row)
+                    previous = row[1]
+            self.coverage = f"{len(self.catalog)} categories checked"
+        else:
+            self.index = self.rows_for(selected)
+            entry = self.catalog[selected]
+            self.coverage = f"{entry['read']}/{entry['total']} listings read on last refresh"
+        self.render(keep_view)
 
     def show_catalog(self):
         window = tk.Toplevel(self)
@@ -799,7 +1030,10 @@ class App(tk.Tk):
         if not self.catalog:
             details.insert("end", "No categories have been checked yet.")
         for label, entry in sorted(self.catalog.items()):
-            checked = datetime.fromisoformat(entry["checked"]).strftime("%Y-%m-%d %H:%M")
+            try:
+                checked = datetime.fromisoformat(entry["checked"]).strftime("%Y-%m-%d %H:%M")
+            except ValueError:
+                checked = "not checked yet"
             details.insert("end", f"{label} • {checked} • {entry['read']}/{entry['total']} items read\n")
             for error in entry["errors"]:
                 details.insert("end", f"  {error}\n")
@@ -808,13 +1042,16 @@ class App(tk.Tk):
             details.insert("end", "\n")
         details.configure(state="disabled")
 
-    def render(self):
+    def render(self, keep_view=False):
+        """Fill the results list. keep_view keeps the selection and scroll position."""
+        chosen = self.selected() if keep_view else None
+        top = self.tree.yview()[0] if keep_view else 0
         self.tree.delete(*self.tree.get_children())
         terms = self.search.get().casefold().split()
         self.rows.clear()
         count = 0
-        for rom in self.index:
-            searchable = f"{rom.name} {rom.collection} {rom.source}".casefold()
+        reselect = None
+        for _, _, rom, searchable in self.index:
             if not all(term in searchable for term in terms):
                 continue
             count += 1
@@ -827,6 +1064,12 @@ class App(tk.Tk):
                     else "Check link" if rom.source == "BlueRoms" else "Public"
                 ))
                 self.rows[row] = rom
+                if chosen is not None and rom.url == chosen.url:
+                    reselect = row
+        if keep_view:
+            if reselect is not None:
+                self.tree.selection_set(reselect)
+            self.tree.yview_moveto(top)
         if self.combo.cget("state") == "readonly":
             caption = f"{count:,} matches • {self.coverage}"
             if count > 500:
@@ -1137,5 +1380,16 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    try:
+        App().mainloop()
+    except Exception:
+        # A .pyw has no console, so without this a start-up crash shows nothing at all.
+        log_problem(traceback.format_exc())
+        try:
+            messagebox.showerror(
+                "Spine ROM Browser",
+                f"Spine ROM Browser could not start.\n\nDetails were saved to:\n{STATE_PATH / 'errors.log'}",
+            )
+        except Exception:
+            pass
 
