@@ -7,7 +7,8 @@ import tempfile
 import threading
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime
 from functools import lru_cache
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -17,6 +18,8 @@ from urllib.parse import quote, unquote, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 ROOT = "https://r-roms.gitlab.io/"
+ALL_PLATFORMS = "All indexed platforms"
+STATE_PATH = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Megathread ROM Browser"
 ARCHIVE = "https://archive.org"
 EXTENSIONS = set(
     ".zip .7z .rar .iso .chd .rvz .wbfs .wua .cia .3ds .nds .gba .gbc .gb "
@@ -121,7 +124,7 @@ class Rom:
     locked: bool
 
 
-@lru_cache(maxsize=96)
+@lru_cache(maxsize=16)
 def metadata(identifier):
     return json.loads(read(f"{ARCHIVE}/metadata/{quote(identifier)}", "archive"))
 
@@ -180,6 +183,53 @@ def download(rom, destination, progress):
                 partial.unlink(missing_ok=True)
 
 
+def load_state(filename, default):
+    try:
+        return json.loads((STATE_PATH / filename).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
+def save_state(filename, value):
+    STATE_PATH.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=STATE_PATH, delete=False
+    ) as output:
+        partial = Path(output.name)
+        try:
+            json.dump(value, output, ensure_ascii=False)
+            output.close()
+            partial.replace(STATE_PATH / filename)
+        finally:
+            output.close()
+            partial.unlink(missing_ok=True)
+
+
+def scan_category(url, progress):
+    groups = {}
+    for identifier, scope in collections(url):
+        groups.setdefault(identifier, []).append(scope)
+
+    def scan_item(identifier, scopes):
+        return [asdict(rom) for scope in scopes for rom in listed_files(identifier, scope)]
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        pending = {
+            pool.submit(scan_item, identifier, scopes): identifier
+            for identifier, scopes in groups.items()
+        }
+        failures = []
+        for count, task in enumerate(as_completed(pending), 1):
+            identifier = pending[task]
+            try:
+                results[identifier] = {rom["url"]: rom for rom in task.result()}
+            except (OSError, ValueError) as exc:
+                failures.append(f"{identifier} • {exc}")
+            progress(count, len(groups))
+    return results, failures, set(groups)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -187,12 +237,14 @@ class App(tk.Tk):
         self.geometry("1000x610")
         self.minsize(670, 400)
         self.events = SimpleQueue()
-        self.category_urls = {}
+        self.catalog = load_state("catalog.json", {})
+        self.settings = load_state("settings.json", {})
         self.index = []
+        self.coverage = ""
         self.rows = {}
         self.busy = False
         self.search = tk.StringVar()
-        self.category = tk.StringVar()
+        self.category = tk.StringVar(value=ALL_PLATFORMS)
         self.status = tk.StringVar()
         self.download_status = tk.StringVar()
         frame = ttk.Frame(self, padding=20)
@@ -200,10 +252,10 @@ class App(tk.Tk):
         ttk.Label(frame, text="Megathread ROM Browser", font=("Segoe UI", 20, "bold")).pack(anchor="w")
         bar = ttk.Frame(frame)
         bar.pack(fill="x", pady=12)
-        self.combo = ttk.Combobox(bar, textvariable=self.category, state="disabled", width=24)
+        self.combo = ttk.Combobox(bar, textvariable=self.category, state="readonly", width=24)
         self.combo.pack(side="left")
-        self.combo.bind("<<ComboboxSelected>>", lambda _: self.load())
-        self.refresh = ttk.Button(bar, text="Reload source", command=self.reload)
+        self.combo.bind("<<ComboboxSelected>>", lambda _: self.select_category())
+        self.refresh = ttk.Button(bar, text="Refresh catalog", command=self.reload)
         self.refresh.pack(side="left", padx=6)
         entry = ttk.Entry(bar, textvariable=self.search)
         entry.pack(side="left", fill="x", expand=True)
@@ -224,14 +276,23 @@ class App(tk.Tk):
         self.tree.bind("<<TreeviewSelect>>", lambda _: self.enable_download())
         self.search.trace_add("write", lambda *_: self.render())
         ttk.Label(frame, textvariable=self.status).pack(anchor="w")
+        self.sync_status = tk.StringVar()
+        ttk.Label(frame, textvariable=self.sync_status).pack(anchor="w")
+        ttk.Button(frame, text="Catalog details…", command=self.show_catalog).pack(anchor="w", pady=(4, 0))
         bottom = ttk.Frame(frame)
         bottom.pack(fill="x", pady=(10, 0))
         self.download_button = ttk.Button(bottom, text="Download selected…", command=self.save)
         self.download_button.pack(side="left")
         ttk.Label(bottom, textvariable=self.download_status).pack(side="left", padx=10)
         self.enable_download()
-        self.after(80, self.process_events)
-        self.reload()
+        self.event_timer = self.after(80, self.process_events)
+        self.select_category()
+        if not self.catalog:
+            self.reload()
+
+    def destroy(self):
+        self.after_cancel(self.event_timer)
+        super().destroy()
 
     def background(self, job, success, error):
         def run():
@@ -250,74 +311,95 @@ class App(tk.Tk):
         except Empty:
             pass
         finally:
-            self.after(80, self.process_events)
+            self.event_timer = self.after(80, self.process_events)
 
     def reload(self):
         self.refresh.configure(state="disabled")
-        self.combo.configure(state="disabled")
-        self.index = []
-        self.status.set("Loading the Megathread…")
-        self.render()
-
-        def ready(values):
-            self.category_urls = values
-            if not values:
-                failed("No platform categories found.")
-                return
-            self.combo.configure(values=list(values))
-            preferred = next((label for label in values if label.lower() == "nintendo"), next(iter(values)))
-            self.category.set(preferred)
-            metadata.cache_clear()
-            self.load()
-
-        def failed(detail):
-            self.status.set(f"Could not load the Megathread. {detail}")
-            self.refresh.configure(state="normal")
-
-        self.background(categories, ready, failed)
-
-    def load(self):
-        category_url = self.category_urls[self.category.get()]
-        self.combo.configure(state="disabled")
-        self.refresh.configure(state="disabled")
-        self.index = []
-        self.coverage = ""
-        self.status.set("Reading Internet Archive collections…")
-        self.render()
+        self.sync_status.set("Reading the Megathread…")
+        previous = self.catalog.copy()
 
         def scan():
-            groups = {}
-            for identifier, scope in collections(category_url):
-                groups.setdefault(identifier, []).append(scope)
+            urls = categories()
+            if not urls:
+                raise ValueError("No platform categories found.")
+            metadata.cache_clear()
+            failures = 0
+            for number, (label, url) in enumerate(urls.items(), 1):
+                def progress(done, total):
+                    caption = f"{number}/{len(urls)} • {label} • {done}/{total} Archive items read"
+                    self.events.put((self.sync_status.set, caption))
 
-            def scan_item(identifier, scopes):
-                return [rom for scope in scopes for rom in listed_files(identifier, scope)]
+                try:
+                    fresh, errors, expected = scan_category(url, progress)
+                    if not expected:
+                        raise ValueError("No supported Archive items found.")
+                    cached = previous.get(label, {}).get("items", {})
+                    items = {key: cached[key] for key in expected - fresh.keys() if key in cached}
+                    items.update(fresh)
+                    entry = {"items": items, "errors": errors, "read": len(fresh), "total": len(expected)}
+                except (OSError, ValueError) as exc:
+                    entry = previous.get(label, {}).copy()
+                    entry.update(errors=[str(exc)], read=0, total=0)
+                failures += bool(entry["errors"])
+                entry["checked"] = datetime.now().astimezone().isoformat(timespec="minutes")
+                previous[label] = entry
+                self.events.put((self.update_catalog, (label, entry)))
+            for label in previous.keys() - urls.keys():
+                self.events.put((self.update_catalog, (label, None)))
+            save_state("catalog.json", {label: previous[label] for label in urls})
+            return f"Refresh complete • {len(urls)} categories checked • {failures} with gaps"
 
-            files = set()
-            failed = 0
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                pending = [pool.submit(scan_item, identifier, scopes) for identifier, scopes in groups.items()]
-                for count, task in enumerate(as_completed(pending), 1):
-                    try:
-                        files.update(task.result())
-                    except Exception:
-                        failed += 1
-                    self.events.put((self.status.set, f"Read {count} of {len(groups)} Archive items…"))
-            return sorted(files, key=lambda rom: (rom.name.casefold(), rom.url)), len(groups), failed
-
-        def ready(result):
-            self.index, total, failed = result
-            self.coverage = f"{total - failed} of {total} Archive items read"
-            finish()
-
-        def finish(error=None):
-            self.combo.configure(state="readonly")
+        def finish(status):
             self.refresh.configure(state="normal")
-            self.render()
-            if error:
-                self.status.set(f"Could not index the category. {error}")
+            self.sync_status.set(status)
 
-        self.background(scan, ready, finish)
+        self.background(scan, finish, lambda error: finish(f"Refresh failed • {error}"))
+
+    def update_catalog(self, update):
+        label, entry = update
+        if entry is None:
+            self.catalog.pop(label, None)
+        else:
+            self.catalog[label] = entry
+        self.select_category()
+
+    def select_category(self):
+        values = [ALL_PLATFORMS, *sorted(self.catalog)]
+        self.combo.configure(values=values)
+        if self.category.get() not in values:
+            self.category.set(ALL_PLATFORMS)
+        selected = self.category.get()
+        entries = self.catalog.values() if selected == ALL_PLATFORMS else [self.catalog[selected]]
+        unique = {}
+        for entry in entries:
+            for files in entry.get("items", {}).values():
+                unique.update(files)
+        self.index = sorted(
+            (Rom(**entry) for entry in unique.values()),
+            key=lambda rom: (rom.name.casefold(), rom.url),
+        )
+        self.coverage = f"{len(self.catalog)} categories checked" if selected == ALL_PLATFORMS else (
+            f"{self.catalog[selected]['read']}/{self.catalog[selected]['total']} Archive items read on last refresh"
+        )
+        self.render()
+
+    def show_catalog(self):
+        window = tk.Toplevel(self)
+        window.title("Catalog details")
+        window.geometry("780x430")
+        details = tk.Text(window, wrap="word", padx=10, pady=10)
+        details.pack(fill="both", expand=True)
+        if not self.catalog:
+            details.insert("end", "No categories have been checked yet.")
+        for label, entry in sorted(self.catalog.items()):
+            checked = datetime.fromisoformat(entry["checked"]).strftime("%Y-%m-%d %H:%M")
+            details.insert("end", f"{label} • {checked} • {entry['read']}/{entry['total']} items read\n")
+            for error in entry["errors"]:
+                details.insert("end", f"  {error}\n")
+            if entry["errors"] and entry.get("items"):
+                details.insert("end", "  Search includes available cached listings.\n")
+            details.insert("end", "\n")
+        details.configure(state="disabled")
 
     def render(self):
         self.tree.delete(*self.tree.get_children())
@@ -357,7 +439,11 @@ class App(tk.Tk):
         name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", PurePosixPath(rom.name).name).rstrip(". ")
         if PureWindowsPath(name).is_reserved():
             name = "_" + name
-        chosen = filedialog.asksaveasfilename(title="Save ROM", initialfile=name, confirmoverwrite=False)
+        folder = self.settings.get("download_folder")
+        chosen = filedialog.asksaveasfilename(
+            title="Save ROM", initialfile=name, confirmoverwrite=False,
+            initialdir=folder if folder and Path(folder).is_dir() else None,
+        )
         if not chosen:
             return
         target = Path(chosen)
@@ -366,6 +452,11 @@ class App(tk.Tk):
             return
         if not messagebox.askokcancel("Confirm download", f"Download {rom.name}? Continue if you have permission to download this file."):
             return
+        self.settings["download_folder"] = str(target.parent)
+        try:
+            save_state("settings.json", self.settings)
+        except OSError as exc:
+            self.sync_status.set(f"Could not remember the download folder • {exc}")
         self.busy = True
         self.enable_download()
         self.download_status.set("Connecting…")

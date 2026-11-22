@@ -14,3 +14,9 @@ A Windows desktop app for searching Internet Archive collections linked by the [
 The app gets its collection links from the Megathread and uses Internet Archive's file listings. Locked files are marked in the results. Files inside a larger archive are searchable only if the host lists them individually.
 
 Downloads use HTTPS, restrict redirects to approved Internet Archive hosts, and compare files with the published SHA-1 when available. The app preserves existing files at the destination. A matching checksum identifies the listed file. Download only files you have permission to obtain.
+
+## Local catalog
+
+On first launch the app reads each Megathread category in the background. Search covers all indexed platforms by default, or you can select one category. Later launches open the saved catalog immediately. Use **Refresh catalog** to update it and **Catalog details** to see when each category was checked and which Archive items failed. If a previously indexed item fails during refresh, its cached listing stays searchable.
+
+The app remembers the last confirmed download folder. Windows stores the catalog and folder preference under `%LOCALAPPDATA%\Megathread ROM Browser`.
