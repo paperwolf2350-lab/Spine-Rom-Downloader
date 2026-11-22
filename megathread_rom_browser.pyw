@@ -6,15 +6,19 @@ import re
 import tempfile
 import threading
 import tkinter as tk
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from functools import lru_cache
 from html.parser import HTMLParser
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from http.cookies import CookieError, SimpleCookie
+from pathlib import Path, PurePosixPath
 from queue import Empty, SimpleQueue
-from tkinter import filedialog, messagebox, ttk
-from urllib.parse import quote, unquote, urljoin, urlsplit
+from time import monotonic
+from tkinter import filedialog, messagebox, simpledialog, ttk
+from urllib.error import HTTPError
+from urllib.parse import quote, unquote, urlencode, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 ROOT = "https://r-roms.gitlab.io/"
@@ -22,11 +26,19 @@ ALL_PLATFORMS = "All indexed platforms"
 STATE_PATH = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Megathread ROM Browser"
 ARCHIVE = "https://archive.org"
 BLUE = "https://www.blueroms.ws"
-BLUE_CATEGORY = "Game Boy Advance (BlueRoms)"
+BLUE_SUFFIX = " (BlueRoms)"
+BLUE_PLATFORMS = {
+    "Arcade", "Dreamcast", "Game Boy Advance", "Mega Drive - Genesis", "Neo Geo",
+    "Nintendo 3DS", "Nintendo 64", "Nintendo DS", "Nintendo GameCube",
+    "Nintendo Switch", "Nintendo Switch 2", "Nintendo Wii", "Nintendo Wii U",
+    "PlayStation", "PlayStation 2", "PlayStation 3", "PlayStation 4", "PlayStation 5",
+    "PlayStation Portable", "PlayStation Vita", "Saturn", "Super Nintendo",
+    "Xbox", "Xbox 360",
+}
 EXTENSIONS = set(
     ".zip .7z .rar .iso .chd .rvz .wbfs .wua .cia .3ds .nds .gba .gbc .gb "
     ".nes .sfc .smc .n64 .z64 .v64 .bin .cue .gdi .cso .pbp .pce .a26 .a52 "
-    ".a78 .sms .gg .md .gen .smd .32x .j64 .jag .xiso .wad .nsp .xci".split()
+    ".a78 .pkg .vpk .cdi .ciso .nrg .cci .nsz .xcz .wud .wux .sms .gg .md .gen .smd .32x .j64 .jag .xiso .wad .nsp .xci".split()
 )
 
 
@@ -42,25 +54,97 @@ def trusted(url, service):
     if service == "blue-file":
         return host == "files.blueroms.ws"
     return host == "archive.org" or bool(re.fullmatch(
-        r"ia[0-9]+\.(?:[a-z0-9-]+\.)?archive\.org", host
+        r"(?:ia|dn)[0-9]+\.(?:[a-z0-9-]+\.)?archive\.org", host
     ))
 
 
 class Redirects(HTTPRedirectHandler):
-    def __init__(self, service):
+    def __init__(self, service, archive_cookie=''):
         self.service = service
+        self.archive_cookie = archive_cookie
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if not trusted(newurl, self.service):
-            raise ValueError("The server redirected outside the approved hosts.")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        if self.service == "archive-login" or not trusted(newurl, self.service):
+            raise ValueError(f"The server redirected to an unapproved host ({urlsplit(newurl).hostname or 'unknown'}).")
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected and self.archive_cookie:
+            redirected.add_unredirected_header("Cookie", self.archive_cookie)
+        return redirected
 
 
-def request(url, service):
+def request(url, service, archive_cookie=''):
     if not trusted(url, service):
         raise ValueError("URL is outside the approved hosts.")
-    opener = build_opener(Redirects(service))
-    return opener.open(Request(url, headers={"User-Agent": "Megathread ROM Browser/0.1"}), timeout=20)
+    cookie = archive_cookie if service == "archive" else ""
+    opener = build_opener(Redirects(service, cookie))
+    req = Request(url, headers={"User-Agent": "Megathread ROM Browser/0.1"})
+    if cookie:
+        req.add_unredirected_header("Cookie", cookie)
+    return opener.open(req, timeout=20)
+
+
+def archive_sign_in(email, password):
+    body = urlencode({"email": email, "password": password}).encode("ascii")
+    req = Request(f"{ARCHIVE}/services/xauthn/?op=login", data=body)
+    opener = build_opener(Redirects("archive-login"))
+    status = 200
+    try:
+        try:
+            response = opener.open(req, timeout=20)
+        except HTTPError as exc:
+            response = exc
+            status = exc.code
+        with response:
+            result = json.loads(response.read(256 * 1024))
+            headers = getattr(response, "headers", None)
+            set_cookies = (headers.get_all("Set-Cookie") or []) if headers else []
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Internet Archive sign-in returned no usable response (HTTP {status}).") from exc
+
+    if isinstance(result, dict):
+        values = result.get("values")
+        values = values if isinstance(values, dict) else {}
+        if result.get("success") is True:
+            names = ("logged-in-user", "logged-in-sig")
+            cookies = values.get("cookies")
+            cookies = cookies if isinstance(cookies, dict) else {}
+            header_cookies = SimpleCookie()
+            for header in set_cookies:
+                try:
+                    header_cookies.load(header)
+                except CookieError:
+                    continue
+
+            session = {}
+            for name in names:
+                header_cookie = header_cookies.get(name)
+                for value in (cookies.get(name), header_cookie.value if header_cookie else None):
+                    if isinstance(value, str):
+                        value = value.strip()
+                        if re.fullmatch(r"[\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]+", value):
+                            session[name] = value
+                            break
+
+            missing = [name for name in names if name not in session]
+            if not missing:
+                return "; ".join(f"{name}={session[name]}" for name in names)
+            raise ValueError(
+                "Internet Archive accepted the sign-in, but its response did not include "
+                f"usable session cookies ({', '.join(missing)}). "
+                "You can use Open on Archive.org to try the item in your signed-in browser."
+            )
+
+        reason = values.get("reason") or result.get("error")
+        if reason == "account_not_found":
+            raise ValueError("Internet Archive’s password endpoint could not find this account email.")
+        if reason == "account_bad_password":
+            raise ValueError("Internet Archive’s password endpoint rejected the password.")
+        if isinstance(reason, str) and re.fullmatch(r"[a-z0-9_]{1,64}", reason):
+            raise ValueError(f"Internet Archive declined this sign-in (HTTP {status}, {reason}).")
+
+    if status == 429:
+        raise ValueError("Internet Archive is limiting sign-in attempts. Try again later.")
+    raise ValueError(f"Internet Archive declined this sign-in (HTTP {status}).")
 
 
 def read(url, service):
@@ -169,32 +253,43 @@ def blue_links(url):
         yield candidate, urlsplit(candidate).path, label
 
 
-def blue_catalog(progress):
-    next_page = f"{BLUE}/gba"
+def blue_platforms():
+    platforms = {}
+    for url, path, label in blue_links(BLUE + "/"):
+        if label in BLUE_PLATFORMS and trusted(url, "blue") and re.fullmatch(r"/[a-z0-9_-]+/?", path):
+            platforms[label] = BLUE + path.rstrip("/")
+    if not platforms:
+        raise ValueError("BlueRoms returned no supported platform links.")
+    return dict(sorted(platforms.items()))
+
+
+def blue_catalog(platform, platform_url, progress):
+    platform_path = urlsplit(platform_url).path.rstrip("/")
+    next_page = platform_url
     visited = set()
     games = {}
-    while next_page and next_page not in visited and len(visited) < 100:
+    while next_page and next_page not in visited and len(visited) < 500:
         visited.add(next_page)
         following = None
         page_games = set()
         for url, path, label in blue_links(next_page):
             if not trusted(url, "blue"):
                 continue
-            if label and re.fullmatch(r"/game/gba/[^/]+/?", path):
+            if label and re.fullmatch(r"/game" + re.escape(platform_path) + r"/[^/]+/?", path):
                 game = BLUE + path.rstrip("/")
                 page_games.add(game)
                 games.setdefault(game, asdict(Rom(
-                    label, "Game Boy Advance", game, 0, "", False, "BlueRoms",
+                    label, platform, game, 0, "", False, "BlueRoms",
                 )))
-            if label in {"»", "Next", "Next »"} and path.rstrip("/") == "/gba" and urlsplit(url).query and url.split("#", 1)[0] != next_page:
+            if label in {"»", "Next", "Next »"} and path.rstrip("/") == platform_path and urlsplit(url).query and url.split("#", 1)[0] != next_page:
                 following = url.split("#", 1)[0]
         if not page_games:
-            raise ValueError("BlueRoms returned a catalog page with no GBA titles.")
+            raise ValueError(f"BlueRoms returned a catalog page with no {platform} titles.")
         next_page = following
         progress(len(visited), len(games))
     if next_page:
         raise ValueError("BlueRoms pagination did not reach the end of the catalog.")
-    return {"gba": games}
+    return {platform_path[1:]: games}
 
 
 def resolve_blue(rom):
@@ -217,24 +312,29 @@ def resolve_blue(rom):
     return replace(rom, name=name, url=url)
 
 
-def download(rom, destination, progress):
+def download(rom, destination, progress, archive_cookie=''):
     written = 0
     digest = hashlib.sha1()
     service = "blue-file" if rom.source == "BlueRoms" else "archive"
-    with request(rom.url, service) as source:
+    response = request(rom.url, service, archive_cookie) if archive_cookie else request(rom.url, service)
+    with response as source:
         if source.headers.get_content_type() in {"text/html", "application/json", "application/xhtml+xml"}:
             raise ValueError("The host returned a page instead of a file.")
+        content_length = source.headers.get("Content-Length")
+        expected = rom.size or (int(content_length) if content_length and content_length.isdecimal() else 0)
+        if destination.exists():
+            raise FileExistsError(f"A file already exists at {destination}")
         with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=".part", delete=False) as output:
             partial = Path(output.name)
             try:
                 while chunk := source.read(256 * 1024):
                     written += len(chunk)
-                    if rom.size and written > rom.size:
+                    if expected and written > expected:
                         raise ValueError("The download exceeds the listed file size.")
                     digest.update(chunk)
                     output.write(chunk)
                     progress(written)
-                if not written or (rom.size and written != rom.size):
+                if not written or (expected and written != expected):
                     raise ValueError("The download is incomplete.")
                 if rom.sha1 and digest.hexdigest() != rom.sha1:
                     raise ValueError("The file did not match the published SHA-1.")
@@ -292,12 +392,64 @@ def scan_category(url, progress):
     return results, failures, set(groups)
 
 
+BACKGROUND = "#212228"
+SURFACE = "#282b33"
+CONTROL = "#343946"
+BORDER = "#454c5e"
+TEXT = "#f4f5f8"
+MUTED = "#c5cee0"
+AMBER = "#ffc66d"
+
+
+def apply_theme(window):
+    window.configure(background=BACKGROUND)
+    window.option_add("*TCombobox*Listbox.background", SURFACE)
+    window.option_add("*TCombobox*Listbox.foreground", TEXT)
+    window.option_add("*TCombobox*Listbox.selectBackground", AMBER)
+    window.option_add("*TCombobox*Listbox.selectForeground", BACKGROUND)
+    window.option_add("*TCombobox*Listbox.font", ("Segoe UI", 10))
+    style = ttk.Style(window)
+    style.theme_use("clam")
+    style.configure(".", font=("Segoe UI", 10), background=BACKGROUND, foreground=TEXT)
+    style.configure("Muted.TLabel", foreground=MUTED)
+    style.configure("Accent.TLabel", foreground=AMBER)
+    style.configure("TButton", padding=(12, 7), background=CONTROL, bordercolor=BORDER,
+                    lightcolor=CONTROL, darkcolor=CONTROL, focuscolor=AMBER)
+    style.map("TButton", background=[("disabled", SURFACE), ("active", BORDER)],
+              foreground=[("disabled", MUTED)])
+    style.configure("Primary.TButton", background=AMBER, foreground=BACKGROUND,
+                    font=("Segoe UI", 10, "bold"), bordercolor=AMBER,
+                    lightcolor=AMBER, darkcolor=AMBER, focuscolor=BACKGROUND)
+    style.map("Primary.TButton", background=[("disabled", "#5c4c36"), ("active", "#ffda9f")],
+              foreground=[("disabled", "#e4d8c6")])
+    style.configure("TEntry", padding=(9, 7), fieldbackground=SURFACE, insertcolor=TEXT,
+                    bordercolor=BORDER, lightcolor=SURFACE, darkcolor=SURFACE)
+    style.configure("TCombobox", padding=(7, 6), fieldbackground=SURFACE, background=CONTROL,
+                    arrowcolor=MUTED, bordercolor=BORDER, lightcolor=CONTROL, darkcolor=CONTROL)
+    style.map("TCombobox", fieldbackground=[("readonly", SURFACE)],
+              selectbackground=[("readonly", SURFACE)], selectforeground=[("readonly", TEXT)])
+    for widget in ("TEntry", "TCombobox"):
+        style.map(widget, bordercolor=[("focus", AMBER)])
+    style.configure("Treeview", background=SURFACE, fieldbackground=SURFACE,
+                    rowheight=30, bordercolor=BORDER, lightcolor=SURFACE, darkcolor=SURFACE)
+    style.map("Treeview", background=[("selected", "#51412d")],
+              foreground=[("selected", "#ffe0ae")])
+    style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"), background=CONTROL,
+                    foreground=MUTED, padding=(8, 7), bordercolor=CONTROL,
+                    lightcolor=CONTROL, darkcolor=CONTROL)
+    style.configure("Vertical.TScrollbar", background=CONTROL, troughcolor=BACKGROUND,
+                    arrowcolor=MUTED, bordercolor=BACKGROUND, lightcolor=CONTROL, darkcolor=CONTROL)
+    style.map("Vertical.TScrollbar", background=[("active", BORDER)])
+    style.configure("TSeparator", background=BORDER)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Megathread ROM Browser")
-        self.geometry("1000x610")
-        self.minsize(670, 400)
+        apply_theme(self)
+        self.title("Spine ROM Browser")
+        self.geometry("1000x670")
+        self.minsize(690, 440)
         self.events = SimpleQueue()
         self.catalog = load_state("catalog.json", {})
         self.settings = load_state("settings.json", {})
@@ -305,25 +457,43 @@ class App(tk.Tk):
         self.coverage = ""
         self.rows = {}
         self.busy = False
+        self.archive_cookie = ''
         self.search = tk.StringVar()
         self.category = tk.StringVar(value=ALL_PLATFORMS)
         self.status = tk.StringVar()
         self.download_status = tk.StringVar()
-        frame = ttk.Frame(self, padding=20)
+        bottom = ttk.Frame(self, padding=(26, 12))
+        bottom.pack(side="bottom", fill="x")
+        ttk.Separator(self).pack(side="bottom", fill="x")
+        frame = ttk.Frame(self, padding=(26, 22, 26, 10))
         frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="Megathread ROM Browser", font=("Segoe UI", 20, "bold")).pack(anchor="w")
+        title = ttk.Frame(frame)
+        title.pack(anchor="w")
+        title_font = ("Segoe UI", 22, "bold")
+        ttk.Label(title, text="Spine", style="Accent.TLabel", font=title_font).pack(side="left")
+        ttk.Label(title, text=" ROM Browser", font=title_font).pack(side="left")
+        ttk.Label(frame, text="Search by filename, region, or collection.",
+                  style="Muted.TLabel").pack(anchor="w", pady=(3, 14))
         bar = ttk.Frame(frame)
-        bar.pack(fill="x", pady=12)
-        self.combo = ttk.Combobox(bar, textvariable=self.category, state="readonly", width=24)
+        bar.pack(fill="x")
+        self.combo = ttk.Combobox(bar, textvariable=self.category, state="readonly", width=29)
         self.combo.pack(side="left")
         self.combo.bind("<<ComboboxSelected>>", lambda _: self.select_category())
-        self.refresh = ttk.Button(bar, text="Refresh catalog", command=self.reload)
-        self.refresh.pack(side="left", padx=6)
+        ttk.Label(bar, text="Search", style="Muted.TLabel").pack(side="left", padx=(14, 7))
         entry = ttk.Entry(bar, textvariable=self.search)
         entry.pack(side="left", fill="x", expand=True)
-        ttk.Label(frame, text="Search by filename, region, or collection").pack(anchor="w")
+        self.refresh = ttk.Button(bar, text="Refresh catalog", command=self.reload)
+        self.refresh.pack(side="left", padx=(10, 0))
+        account_bar = ttk.Frame(frame)
+        account_bar.pack(fill="x", pady=(10, 0))
+        self.account_button = ttk.Button(account_bar, text="Connect Internet Archive…",
+                                         command=self.toggle_archive_account)
+        self.account_button.pack(side="left")
+        self.account_status = tk.StringVar(value="Internet Archive · Signed out")
+        ttk.Label(account_bar, textvariable=self.account_status,
+                  style="Muted.TLabel").pack(side="left", padx=10)
         table = ttk.Frame(frame)
-        table.pack(fill="both", expand=True, pady=8)
+        table.pack(fill="both", expand=True, pady=(14, 7))
         self.tree = ttk.Treeview(table, columns=("file", "collection", "source", "size", "access"), show="headings", selectmode="browse")
         for col, label, width in [
             ("file", "File or title", 380), ("collection", "Collection", 195),
@@ -332,25 +502,31 @@ class App(tk.Tk):
         ]:
             self.tree.heading(col, text=label)
             self.tree.column(col, width=width, stretch=col in {"file", "collection"})
+        self.tree.tag_configure("even", background=SURFACE)
+        self.tree.tag_configure("odd", background="#2d3039")
         scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", lambda _: self.enable_download())
         self.search.trace_add("write", lambda *_: self.render())
-        ttk.Label(frame, textvariable=self.status).pack(anchor="w")
+        ttk.Label(frame, textvariable=self.status, style="Muted.TLabel").pack(anchor="w")
         self.sync_status = tk.StringVar()
-        ttk.Label(frame, textvariable=self.sync_status).pack(anchor="w")
-        ttk.Button(frame, text="Catalog details…", command=self.show_catalog).pack(anchor="w", pady=(4, 0))
-        bottom = ttk.Frame(frame)
-        bottom.pack(fill="x", pady=(10, 0))
-        self.download_button = ttk.Button(bottom, text="Download selected…", command=self.save)
-        self.download_button.pack(side="left")
-        ttk.Label(bottom, textvariable=self.download_status).pack(side="left", padx=10)
+        ttk.Label(frame, textvariable=self.sync_status, style="Muted.TLabel",
+                  wraplength=620).pack(anchor="w")
+        self.download_button = ttk.Button(bottom, text="Download selected…",
+                                          style="Primary.TButton", command=self.save)
+        self.download_button.pack(side="right")
+        self.archive_open_button = ttk.Button(bottom, text="Open on Archive.org",
+                                             command=self.open_archive_item)
+        self.archive_open_button.pack(side="right", padx=(8, 0))
+        ttk.Button(bottom, text="Catalog details…", command=self.show_catalog).pack(side="right", padx=8)
+        ttk.Label(bottom, textvariable=self.download_status, style="Muted.TLabel",
+                  wraplength=380).pack(side="left", fill="x", expand=True)
         self.enable_download()
         self.event_timer = self.after(80, self.process_events)
         self.select_category()
-        if BLUE_CATEGORY not in self.catalog:
+        if not self.catalog:
             self.reload()
 
     def destroy(self):
@@ -383,22 +559,33 @@ class App(tk.Tk):
 
         def scan():
             failures = 0
-            checked = datetime.now().astimezone().isoformat(timespec="minutes")
-
-            def blue_progress(pages, titles):
-                caption = f"BlueRoms • {pages} pages read • {titles} GBA titles"
-                self.events.put((self.sync_status.set, caption))
-
+            blue_labels = {label for label in previous if label.endswith(BLUE_SUFFIX)}
+            blue_issue = ""
             try:
-                items = blue_catalog(blue_progress)
-                blue = {"items": items, "errors": [], "read": 1, "total": 1}
+                platforms = blue_platforms()
             except (OSError, ValueError) as exc:
-                blue = previous.get(BLUE_CATEGORY, {}).copy()
-                blue.update(errors=[str(exc)], read=0, total=1)
-                failures += 1
-            blue["checked"] = checked
-            previous[BLUE_CATEGORY] = blue
-            self.events.put((self.update_catalog, (BLUE_CATEGORY, blue)))
+                platforms = {}
+                blue_issue = f" • BlueRoms discovery failed: {exc}"
+            for number, (platform, url) in enumerate(platforms.items(), 1):
+                label = platform + BLUE_SUFFIX
+                blue_labels.add(label)
+
+                def blue_progress(pages, titles):
+                    caption = f"BlueRoms {number}/{len(platforms)} • {platform} • {pages} pages • {titles} titles"
+                    self.events.put((self.sync_status.set, caption))
+
+                try:
+                    items = blue_catalog(platform, url, blue_progress)
+                    blue = {"items": items, "errors": [], "read": 1, "total": 1}
+                except (OSError, ValueError) as exc:
+                    blue = previous.get(label, {}).copy()
+                    blue.update(errors=[str(exc)], read=0, total=1)
+                    failures += 1
+                blue["checked"] = datetime.now().astimezone().isoformat(timespec="minutes")
+                previous[label] = blue
+                self.events.put((self.update_catalog, (label, blue)))
+            if platforms:
+                save_state("catalog.json", previous)
 
             try:
                 urls = categories()
@@ -406,8 +593,7 @@ class App(tk.Tk):
                     raise ValueError("No platform categories found.")
             except (OSError, ValueError) as exc:
                 save_state("catalog.json", previous)
-                blue_status = "unavailable" if blue["errors"] else "updated"
-                return f"BlueRoms {blue_status} • Megathread refresh failed • {exc}"
+                return f"Megathread refresh failed • {exc}{blue_issue}"
 
             metadata.cache_clear()
             for number, (label, url) in enumerate(urls.items(), 1):
@@ -430,11 +616,11 @@ class App(tk.Tk):
                 entry["checked"] = datetime.now().astimezone().isoformat(timespec="minutes")
                 previous[label] = entry
                 self.events.put((self.update_catalog, (label, entry)))
-            current = urls.keys() | {BLUE_CATEGORY}
+            current = urls.keys() | blue_labels
             for label in previous.keys() - current:
                 self.events.put((self.update_catalog, (label, None)))
             save_state("catalog.json", {label: previous[label] for label in current})
-            return f"Refresh complete • {len(current)} categories checked • {failures} with gaps"
+            return f"Refresh complete • {len(current)} categories checked • {failures} with gaps{blue_issue}"
 
         def finish(status):
             self.refresh.configure(state="normal")
@@ -472,9 +658,12 @@ class App(tk.Tk):
 
     def show_catalog(self):
         window = tk.Toplevel(self)
+        window.configure(background=BACKGROUND)
         window.title("Catalog details")
         window.geometry("780x430")
-        details = tk.Text(window, wrap="word", padx=10, pady=10)
+        details = tk.Text(window, wrap="word", padx=16, pady=14, relief="flat",
+                          background=SURFACE, foreground=TEXT, font=("Segoe UI", 10),
+                          selectbackground=AMBER, selectforeground=BACKGROUND)
         details.pack(fill="both", expand=True)
         if not self.catalog:
             details.insert("end", "No categories have been checked yet.")
@@ -500,9 +689,10 @@ class App(tk.Tk):
             count += 1
             if count <= 500:
                 size = f"{rom.size / 1048576:,.1f} MB" if rom.size else "Unknown"
-                row = self.tree.insert("", "end", values=(
+                row = self.tree.insert("", "end", tags=("odd" if count % 2 else "even",), values=(
                     rom.name, rom.collection, rom.source, size,
-                    "Locked" if rom.locked else ("Check link" if rom.source == "BlueRoms" else "Public")
+                    ("Check access" if self.archive_cookie else "Sign in")
+                    if rom.locked else ("Check link" if rom.source == "BlueRoms" else "Public")
                 ))
                 self.rows[row] = rom
         if self.combo.cget("state") == "readonly":
@@ -516,79 +706,158 @@ class App(tk.Tk):
         selected = self.tree.selection()
         return self.rows.get(selected[0]) if selected else None
 
+    def toggle_archive_account(self):
+        if self.archive_cookie:
+            self.archive_cookie = ""
+            self.account_button.configure(text="Connect Internet Archive…")
+            self.account_status.set("Internet Archive · Signed out")
+            self.render()
+            return
+        email = simpledialog.askstring(
+            "Connect Internet Archive", "Internet Archive account email:", parent=self,
+        )
+        if not email or not email.strip():
+            return
+        password = simpledialog.askstring(
+            "Connect Internet Archive", "Internet Archive password:", show="*", parent=self,
+        )
+        if not password:
+            return
+        self.account_status.set("Internet Archive · Signing in…")
+        self.account_button.configure(state="disabled")
+
+        def ready(cookie):
+            self.archive_cookie = cookie
+            self.account_button.configure(text="Disconnect Internet Archive", state="normal")
+            self.account_status.set("Internet Archive · Signed in for this session")
+            self.render()
+
+        def failed(error):
+            self.account_button.configure(state="normal")
+            self.account_status.set("Internet Archive · Sign-in failed")
+            messagebox.showerror("Internet Archive sign-in", error, parent=self)
+
+        self.background(lambda: archive_sign_in(email.strip(), password), ready, failed)
+
+    def open_archive_item(self):
+        rom = self.selected()
+        if rom and rom.source == "Internet Archive" and trusted(rom.url, "archive"):
+            match = re.match(r"/download/([a-zA-Z0-9_.-]+)/", urlsplit(rom.url).path)
+            if match:
+                webbrowser.open(f"{ARCHIVE}/details/{match[1]}")
+
     def enable_download(self):
         rom = self.selected()
-        self.download_button.configure(state="normal" if rom and not rom.locked and not self.busy else "disabled")
+        self.archive_open_button.configure(
+            state="normal" if rom and rom.source == "Internet Archive" else "disabled",
+        )
+        self.download_button.configure(state="normal" if rom and (not rom.locked or self.archive_cookie) and not self.busy else "disabled")
 
     def save(self):
         rom = self.selected()
-        if not rom or rom.locked or self.busy:
+        if not rom or (rom.locked and not self.archive_cookie) or self.busy:
             return
         if rom.source == "BlueRoms":
-            self.busy = True
-            self.enable_download()
-            self.download_status.set("Looking up BlueRoms download…")
-
-            def ready(file):
-                self.busy = False
-                self.download_status.set("")
-                self.enable_download()
-                self.choose_destination(file)
-
-            def failed(error):
-                self.busy = False
-                self.enable_download()
-                self.download_status.set("BlueRoms link unavailable")
-                messagebox.showerror("Could not find download", error)
-
-            self.background(lambda: resolve_blue(rom), ready, failed)
+            folder = filedialog.askdirectory(
+                parent=self, title="Choose where to save the ROM",
+                initialdir=self.download_folder(), mustexist=True,
+            )
+            if not folder:
+                return
+            self.start_download(rom, Path(folder), choose_filename=True)
         else:
-            self.choose_destination(rom)
+            chosen = filedialog.asksaveasfilename(
+                parent=self, title="Save ROM", initialfile=self.filename(rom),
+                confirmoverwrite=False, initialdir=self.download_folder(),
+            )
+            if chosen:
+                self.start_download(rom, Path(chosen))
 
-    def choose_destination(self, rom):
-        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", PurePosixPath(rom.name).name).rstrip(". ")
-        if PureWindowsPath(name).is_reserved():
-            name = "_" + name
+    def download_folder(self):
         folder = self.settings.get("download_folder")
-        chosen = filedialog.asksaveasfilename(
-            title="Save ROM", initialfile=name, confirmoverwrite=False,
-            initialdir=folder if folder and Path(folder).is_dir() else None,
-        )
-        if not chosen:
+        return folder if folder and Path(folder).is_dir() else str(Path.home())
+
+    @staticmethod
+    def filename(rom):
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", PurePosixPath(rom.name).name).rstrip(". ")
+        stem = name.partition(".")[0].rstrip().upper()
+        reserved = re.fullmatch(r"CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|(?:COM|LPT)[0-9¹²³]", stem)
+        if reserved:
+            name = "_" + name
+        return name
+
+    def start_download(self, rom, destination, choose_filename=False):
+        folder = destination if choose_filename else destination.parent
+        if not messagebox.askokcancel(
+            "Confirm download",
+            f"Download {rom.name} to {destination}?\n\nContinue if you have permission to download this file.",
+            parent=self,
+        ):
+            self.download_status.set("Download canceled")
             return
-        target = Path(chosen)
-        if target.exists():
-            messagebox.showerror("File already exists", "Choose a new filename to keep the existing file.")
-            return
-        if not messagebox.askokcancel("Confirm download", f"Download {rom.name}? Continue if you have permission to download this file."):
-            return
-        self.settings["download_folder"] = str(target.parent)
+        self.settings["download_folder"] = str(folder)
         try:
             save_state("settings.json", self.settings)
         except OSError as exc:
             self.sync_status.set(f"Could not remember the download folder • {exc}")
         self.busy = True
         self.enable_download()
-        self.download_status.set("Connecting…")
+        status = "Looking up BlueRoms file…" if choose_filename else "Connecting to Internet Archive…"
+        self.download_status.set(status)
+        archive_cookie = self.archive_cookie if rom.source == "Internet Archive" else ""
+        last_update = float("-inf")
 
         def report(written):
-            if written % (4 * 1024 * 1024) == 0:
-                self.events.put((self.download_status.set, f"Downloaded {written / 1048576:,.0f} MB…"))
+            nonlocal last_update
+            now = monotonic()
+            if now - last_update >= 0.25:
+                last_update = now
+                self.events.put((
+                    self.download_status.set, f"Received {written / 1048576:,.2f} MiB…",
+                ))
 
         def finish(status):
             self.busy = False
             self.download_status.set(status)
             self.enable_download()
 
+        def saved(status):
+            finish("Download complete")
+            messagebox.showinfo("Download complete", status, parent=self)
+
         def failed(error):
             finish("Download failed")
-            messagebox.showerror("Download failed", error)
+            messagebox.showerror(
+                "Download failed",
+                f"{error}\n\nDestination folder: {folder}",
+                parent=self,
+            )
 
         def transfer():
-            download(rom, target, report)
-            return "Saved • SHA-1 matched" if rom.sha1 else "Saved • no checksum provided"
+            file = rom
+            target = destination
+            if choose_filename:
+                try:
+                    file = resolve_blue(rom)
+                except (OSError, ValueError) as exc:
+                    raise ValueError(f"BlueRoms link lookup failed: {exc}") from exc
+                target = folder / self.filename(file)
+                self.events.put((self.download_status.set, f"Connecting to save {target.name}…"))
+            try:
+                download(file, target, report, archive_cookie)
+            except HTTPError as exc:
+                if archive_cookie and exc.code in (401, 403):
+                    raise ValueError(
+                        f"Internet Archive denied access (HTTP {exc.code}). "
+                        "Reconnect if the session expired. This item may still be restricted."
+                    ) from exc
+                raise ValueError(f"Could not download {target.name}: HTTP {exc.code}") from exc
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"Could not save {target.name}: {exc}") from exc
+            checksum = "SHA-1 matched" if file.sha1 else "no checksum provided"
+            return f"Saved to {target} • {checksum}"
 
-        self.background(transfer, finish, failed)
+        self.background(transfer, saved, failed)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
-# Megathread ROM Browser
+# Spine ROM Browser
 
-A Windows desktop app for searching Internet Archive collections linked by the [r/ROMs Megathread](https://r-roms.gitlab.io/) and saving public files directly to your PC. An experimental BlueRoms integration adds Game Boy Advance titles. It can be used alongside [Spine](https://github.com/paperwolf2350-lab/Spine).
+A Windows desktop app for searching Internet Archive collections linked by the [r/ROMs Megathread](https://r-roms.gitlab.io/) and saving public files directly to your PC. BlueRoms adds titles from its supported platform catalogs. It can be used alongside [Spine](https://github.com/paperwolf2350-lab/Spine).
 
 ## Run on Windows
 
@@ -22,6 +22,14 @@ On first launch the app reads each Megathread category in the background. Search
 The app remembers the last confirmed download folder. Windows stores the catalog and folder preference under `%LOCALAPPDATA%\Megathread ROM Browser`.
 
 
-## BlueRoms pilot
+## BlueRoms catalogs
 
-Select **Game Boy Advance (BlueRoms)** to explore just that catalog, or search all sources together. The **Source** column identifies each listing. BlueRoms links are resolved when you select a download, using the site's direct HTTPS file host. A title is listed before the app checks whether it has a supported direct file. The pilot supports titles with one direct file, and reports unavailable or ambiguous links in the app.
+Use **Refresh catalog** after upgrading to discover the other BlueRoms platforms. Select a category marked **(BlueRoms)** or search all sources together. The **Source** column identifies each listing. For a BlueRoms download, choose the destination folder and confirm the download. The app then looks up the file, shows transfer progress, and reports the full saved path or the reason it could not save the file. A title is listed before the app checks whether it has a supported direct file. Direct downloads support titles with one compatible direct file, and reports unavailable or ambiguous links in the app.
+
+
+
+
+
+## Internet Archive sign-in
+
+Choose **Connect Internet Archive…** to sign in with your Internet Archive account. The app sends your credentials only to Internet Archive over HTTPS. It keeps the session in memory until you disconnect or close the app. Public downloads are available without signing in. After connecting, select a restricted result to check whether Internet Archive allows your account to download it.
