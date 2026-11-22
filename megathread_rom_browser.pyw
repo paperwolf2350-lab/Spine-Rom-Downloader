@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import tempfile
 import threading
 import tkinter as tk
@@ -13,6 +14,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from functools import lru_cache
 from html.parser import HTMLParser
+from http.client import HTTPException
 from itertools import chain
 from operator import itemgetter
 from http.cookies import CookieError, SimpleCookie
@@ -78,12 +80,14 @@ class Redirects(HTTPRedirectHandler):
         return redirected
 
 
-def request(url, service, archive_cookie=''):
+def request(url, service, archive_cookie='', start=0):
     if not trusted(url, service):
         raise ValueError("URL is outside the approved hosts.")
     cookie = archive_cookie if service == "archive" else ""
     opener = build_opener(Redirects(service, cookie))
     req = Request(url, headers={"User-Agent": "Megathread ROM Browser/0.1"})
+    if start:
+        req.add_header("Range", f"bytes={start}-")
     if cookie:
         req.add_unredirected_header("Cookie", cookie)
     return opener.open(req, timeout=20)
@@ -376,40 +380,111 @@ def check_cancel(cancel):
         raise DownloadCanceled("Canceled by user.")
 
 
-def download(rom, destination, progress, archive_cookie='', cancel=None):
+class ConnectionDropped(Exception):
+    """The network failed part-way. Disk problems are never reported as this."""
+
+
+def free_space(folder):
+    """Free bytes on the drive holding folder, or None if it cannot be told."""
+    try:
+        return shutil.disk_usage(folder).free
+    except OSError:
+        return None
+
+
+def check_space(folder, size):
+    free = free_space(folder)
+    if size and free is not None and free < size:
+        raise ValueError(
+            f"Not enough free space: the file needs {size / 1073741824:,.2f} GB "
+            f"and the drive has {free / 1073741824:,.2f} GB free."
+        )
+
+
+def download(rom, destination, progress, archive_cookie='', cancel=None, note=None):
+    """Save rom to destination.
+
+    If the connection drops part-way, reconnect and ask the host for the rest
+    of the file instead of starting over. The finished file is still checked
+    against the listed size and SHA-1 as a whole.
+    """
     check_cancel(cancel)
-    written = 0
-    digest = hashlib.sha1()
+    if destination.exists():
+        raise FileExistsError(f"A file already exists at {destination}")
     service = "blue-file" if rom.source == "BlueRoms" else "archive"
-    response = request(rom.url, service, archive_cookie) if archive_cookie else request(rom.url, service)
-    with response as source:
-        if source.headers.get_content_type() in {"text/html", "application/json", "application/xhtml+xml"}:
-            raise ValueError("The host returned a page instead of a file.")
-        content_length = source.headers.get("Content-Length")
-        expected = rom.size or (int(content_length) if content_length and content_length.isdecimal() else 0)
-        if destination.exists():
-            raise FileExistsError(f"A file already exists at {destination}")
-        with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=".part", delete=False) as output:
-            partial = Path(output.name)
-            try:
-                while chunk := source.read(256 * 1024):
+    written = 0
+    expected = rom.size
+    digest = hashlib.sha1()
+    stalls = 0
+    check_space(destination.parent, expected)
+    with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=".part", delete=False) as output:
+        partial = Path(output.name)
+        try:
+            while True:
+                before = written
+                try:
+                    try:
+                        source = request(rom.url, service, archive_cookie, written)
+                    except HTTPError:
+                        raise
+                    except (OSError, HTTPException) as exc:
+                        raise ConnectionDropped(str(exc)) from exc
+                    with source:
+                        if source.headers.get_content_type() in {"text/html", "application/json", "application/xhtml+xml"}:
+                            raise ValueError("The host returned a page instead of a file.")
+                        resumed = (source.status == 206 and (source.headers.get("Content-Range") or "")
+                                   .startswith(f"bytes {written}-"))
+                        if written and not resumed:
+                            if source.status == 206:
+                                raise ValueError("The host resumed from the wrong place.")
+                            # The host sent the whole file again: start over.
+                            output.seek(0)
+                            output.truncate()
+                            written = before = 0
+                            digest = hashlib.sha1()
+                        if not written and not expected:
+                            content_length = source.headers.get("Content-Length")
+                            if content_length and content_length.isdecimal():
+                                expected = int(content_length)
+                                check_space(destination.parent, expected)
+                        while True:
+                            try:
+                                chunk = source.read(256 * 1024)
+                            except (OSError, HTTPException) as exc:
+                                raise ConnectionDropped(str(exc)) from exc
+                            if not chunk:
+                                break
+                            check_cancel(cancel)
+                            written += len(chunk)
+                            if expected and written > expected:
+                                raise ValueError("The download exceeds the listed file size.")
+                            digest.update(chunk)
+                            output.write(chunk)
+                            progress(written)
+                    if expected and written < expected:
+                        raise ConnectionDropped("the host closed the connection early")
+                    break
+                except ConnectionDropped as exc:
+                    # Keep trying while each attempt makes progress; give up
+                    # after three attempts in a row that receive nothing.
+                    stalls = 0 if written > before else stalls + 1
+                    if not written or stalls >= 3:
+                        raise OSError(f"The connection was lost ({exc}).") from exc
+                    if note:
+                        note(f"Connection lost at {written / 1048576:,.1f} MiB. Reconnecting…")
+                    if cancel is not None:
+                        cancel.wait(3 * (stalls + 1))
                     check_cancel(cancel)
-                    written += len(chunk)
-                    if expected and written > expected:
-                        raise ValueError("The download exceeds the listed file size.")
-                    digest.update(chunk)
-                    output.write(chunk)
-                    progress(written)
-                if not written or (expected and written != expected):
-                    raise ValueError("The download is incomplete.")
-                if rom.sha1 and digest.hexdigest() != rom.sha1:
-                    raise ValueError("The file did not match the published SHA-1.")
-                output.close()
-                check_cancel(cancel)
-                os.rename(partial, destination)
-            finally:
-                output.close()
-                partial.unlink(missing_ok=True)
+            if not written or (expected and written != expected):
+                raise ValueError("The download is incomplete.")
+            if rom.sha1 and digest.hexdigest() != rom.sha1:
+                raise ValueError("The file did not match the published SHA-1.")
+            output.close()
+            check_cancel(cancel)
+            os.rename(partial, destination)
+        finally:
+            output.close()
+            partial.unlink(missing_ok=True)
 
 
 STATE_NOTES = []
@@ -756,7 +831,7 @@ class App(tk.Tk):
         ttk.Label(bar, text="Search", style="Muted.TLabel").pack(side="left", padx=(14, 7))
         entry = ttk.Entry(bar, textvariable=self.search)
         entry.pack(side="left", fill="x", expand=True)
-        self.refresh = ttk.Button(bar, text="Refresh catalog", command=self.reload)
+        self.refresh = ttk.Button(bar, text="Refresh all", command=self.reload)
         self.refresh.pack(side="left", padx=(10, 0))
         account_bar = ttk.Frame(frame)
         account_bar.pack(fill="x", pady=(10, 0))
@@ -790,7 +865,8 @@ class App(tk.Tk):
         scroll.pack(side="right", fill="y")
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", lambda _: self.enable_download())
-        self.search.trace_add("write", lambda *_: self.render())
+        self.search_timer = None
+        self.search.trace_add("write", lambda *_: self.schedule_search())
         ttk.Label(frame, textvariable=self.status, style="Muted.TLabel").pack(anchor="w")
         self.sync_status = tk.StringVar()
         ttk.Label(frame, textvariable=self.sync_status, style="Muted.TLabel",
@@ -834,6 +910,8 @@ class App(tk.Tk):
         self.after_cancel(self.event_timer)
         if self.rebuild_timer is not None:
             self.after_cancel(self.rebuild_timer)
+        if self.search_timer is not None:
+            self.after_cancel(self.search_timer)
         super().destroy()
 
     def background(self, job, success, error, *, daemon=True):
@@ -858,71 +936,34 @@ class App(tk.Tk):
             self.event_timer = self.after(80, self.process_events)
 
     def reload(self):
+        """Refresh the chosen category, or everything when all platforms are shown."""
+        only = self.category.get()
+        only = None if only == ALL_PLATFORMS else only
         self.refresh.configure(state="disabled")
-        self.sync_status.set("Reading the Megathread…")
+        self.sync_status.set(f"Refreshing {only}…" if only else "Reading the Megathread…")
         previous = self.catalog.copy()
-
         archive_cookie = self.archive_cookie
 
-        def scan():
-            metadata.cache_clear()
+        def post(text):
+            self.events.put((self.sync_status.set, text))
+
+        def store(label, entry):
+            entry["checked"] = datetime.now().astimezone().isoformat(timespec="minutes")
+            previous[label] = entry
+            self.events.put((self.update_catalog, (label, entry)))
+            return bool(entry["errors"])
+
+        def scan_megathread():
+            urls = categories()
+            if not urls:
+                raise ValueError("No platform categories found.")
+            if only and only not in urls:
+                raise ValueError("The Megathread no longer lists this category.")
+            wanted = {only: urls[only]} if only else urls
             failures = 0
-            self.events.put((self.sync_status.set, "Reading Internet Archive Game Boy ZIP…"))
-            zip_entry = previous.get(ZIP_CATEGORY, {}).copy()
-            try:
-                archive, = listed_files(ZIP_ITEM, ZIP_SCOPE)
-                members = archive_members(archive, archive_cookie)
-                zip_entry = {"items": {ZIP_ITEM: members}, "errors": [], "read": 1, "total": 1}
-            except (OSError, ValueError) as exc:
-                detail = str(exc)
-                if isinstance(exc, HTTPError) and exc.code in (401, 403) and not archive_cookie:
-                    detail = f"Internet Archive returned HTTP {exc.code}. Connect your account and refresh to try the ZIP listing."
-                zip_entry.update(errors=[detail], read=0, total=1)
-                failures += 1
-            zip_entry["checked"] = datetime.now().astimezone().isoformat(timespec="minutes")
-            previous[ZIP_CATEGORY] = zip_entry
-            self.events.put((self.update_catalog, (ZIP_CATEGORY, zip_entry)))
-            save_state("catalog.json", previous)
-            blue_labels = {label for label in previous if label.endswith(BLUE_SUFFIX)}
-            blue_issue = ""
-            try:
-                platforms = blue_platforms()
-            except (OSError, ValueError) as exc:
-                platforms = {}
-                blue_issue = f" • BlueRoms discovery failed: {exc}"
-            for number, (platform, url) in enumerate(platforms.items(), 1):
-                label = platform + BLUE_SUFFIX
-                blue_labels.add(label)
-
-                def blue_progress(pages, titles):
-                    caption = f"BlueRoms {number}/{len(platforms)} • {platform} • {pages} pages • {titles} titles"
-                    self.events.put((self.sync_status.set, caption))
-
-                try:
-                    items = blue_catalog(platform, url, blue_progress)
-                    blue = {"items": items, "errors": [], "read": 1, "total": 1}
-                except (OSError, ValueError) as exc:
-                    blue = previous.get(label, {}).copy()
-                    blue.update(errors=[str(exc)], read=0, total=1)
-                    failures += 1
-                blue["checked"] = datetime.now().astimezone().isoformat(timespec="minutes")
-                previous[label] = blue
-                self.events.put((self.update_catalog, (label, blue)))
-            if platforms:
-                save_state("catalog.json", previous)
-
-            try:
-                urls = categories()
-                if not urls:
-                    raise ValueError("No platform categories found.")
-            except (OSError, ValueError) as exc:
-                save_state("catalog.json", previous)
-                return f"Megathread refresh failed • {exc}{blue_issue}"
-
-            for number, (label, url) in enumerate(urls.items(), 1):
+            for number, (label, url) in enumerate(wanted.items(), 1):
                 def progress(done, total):
-                    caption = f"{number}/{len(urls)} • {label} • {done}/{total} Archive items read"
-                    self.events.put((self.sync_status.set, caption))
+                    post(f"{number}/{len(wanted)} • {label} • {done}/{total} Archive items read")
 
                 try:
                     fresh, errors, expected = scan_category(url, progress)
@@ -935,15 +976,88 @@ class App(tk.Tk):
                 except (OSError, ValueError) as exc:
                     entry = previous.get(label, {}).copy()
                     entry.update(errors=[str(exc)], read=0, total=0)
-                failures += bool(entry["errors"])
-                entry["checked"] = datetime.now().astimezone().isoformat(timespec="minutes")
-                previous[label] = entry
-                self.events.put((self.update_catalog, (label, entry)))
-            current = urls.keys() | blue_labels | {ZIP_CATEGORY}
-            for label in previous.keys() - current:
-                self.events.put((self.update_catalog, (label, None)))
-            save_state("catalog.json", {label: previous[label] for label in current})
-            return f"Refresh complete • {len(current)} categories checked • {failures} with gaps{blue_issue}"
+                failures += store(label, entry)
+            return set(urls), failures
+
+        def scan_zip():
+            post("Reading Internet Archive Game Boy ZIP…")
+            try:
+                archive, = listed_files(ZIP_ITEM, ZIP_SCOPE)
+                members = archive_members(archive, archive_cookie)
+                entry = {"items": {ZIP_ITEM: members}, "errors": [], "read": 1, "total": 1}
+            except (OSError, ValueError) as exc:
+                detail = str(exc)
+                if isinstance(exc, HTTPError) and exc.code in (401, 403) and not archive_cookie:
+                    detail = f"Internet Archive returned HTTP {exc.code}. Connect your account and refresh to try the ZIP listing."
+                entry = previous.get(ZIP_CATEGORY, {}).copy()
+                entry.update(errors=[detail], read=0, total=1)
+            return store(ZIP_CATEGORY, entry)
+
+        def scan_blue():
+            platforms = blue_platforms()
+            listed = {platform + BLUE_SUFFIX for platform in platforms}
+            if only:
+                if only not in listed:
+                    raise ValueError("BlueRoms no longer lists this platform.")
+                platform = only[:-len(BLUE_SUFFIX)]
+                platforms = {platform: platforms[platform]}
+            failures = 0
+            for number, (platform, url) in enumerate(platforms.items(), 1):
+                label = platform + BLUE_SUFFIX
+
+                def progress(pages, titles):
+                    post(f"BlueRoms {number}/{len(platforms)} • {platform} • {pages} pages • {titles} titles")
+
+                try:
+                    items = blue_catalog(platform, url, progress)
+                    entry = {"items": items, "errors": [], "read": 1, "total": 1}
+                except (OSError, ValueError) as exc:
+                    entry = previous.get(label, {}).copy()
+                    entry.update(errors=[str(exc)], read=0, total=1)
+                failures += store(label, entry)
+            return listed, failures
+
+        def scan():
+            metadata.cache_clear()
+            if only:
+                try:
+                    if only == ZIP_CATEGORY:
+                        failures = scan_zip()
+                    elif only.endswith(BLUE_SUFFIX):
+                        failures = scan_blue()[1]
+                    else:
+                        failures = scan_megathread()[1]
+                except (OSError, ValueError) as exc:
+                    return f"Could not refresh {only} • {exc}"
+                save_state("catalog.json", previous)
+                gaps = " • some listings could not be read (see Catalog details)" if failures else ""
+                return f"{only} refreshed{gaps}"
+
+            issues = ""
+            failures = 0
+            megathread = blue = None
+            try:
+                megathread, failures = scan_megathread()
+            except (OSError, ValueError) as exc:
+                issues += f" • Megathread refresh failed: {exc}"
+            save_state("catalog.json", previous)
+            failures += scan_zip()
+            save_state("catalog.json", previous)
+            try:
+                blue, blue_failures = scan_blue()
+                failures += blue_failures
+            except (OSError, ValueError) as exc:
+                issues += f" • BlueRoms discovery failed: {exc}"
+            # Drop categories a source no longer lists, but only if that source answered.
+            for label in list(previous):
+                if label == ZIP_CATEGORY:
+                    continue
+                listed = blue if label.endswith(BLUE_SUFFIX) else megathread
+                if listed is not None and label not in listed:
+                    del previous[label]
+                    self.events.put((self.update_catalog, (label, None)))
+            save_state("catalog.json", previous)
+            return f"Refresh complete • {len(previous)} categories checked • {failures} with gaps{issues}"
 
         def finish(status):
             self.refresh.configure(state="normal")
@@ -1002,6 +1116,7 @@ class App(tk.Tk):
             self.after_cancel(self.rebuild_timer)
             self.rebuild_timer = None
         selected = self.category.get()
+        self.refresh.configure(text="Refresh all" if selected == ALL_PLATFORMS else "Refresh this category")
         if selected == ALL_PLATFORMS:
             merged = sorted(chain.from_iterable(self.rows_for(label) for label in self.catalog),
                             key=itemgetter(0, 1))
@@ -1042,8 +1157,17 @@ class App(tk.Tk):
             details.insert("end", "\n")
         details.configure(state="disabled")
 
+    def schedule_search(self):
+        """Search shortly after typing pauses, not on every key."""
+        if self.search_timer is not None:
+            self.after_cancel(self.search_timer)
+        self.search_timer = self.after(200, self.render)
+
     def render(self, keep_view=False):
         """Fill the results list. keep_view keeps the selection and scroll position."""
+        if self.search_timer is not None:
+            self.after_cancel(self.search_timer)
+            self.search_timer = None
         chosen = self.selected() if keep_view else None
         top = self.tree.yview()[0] if keep_view else 0
         self.tree.delete(*self.tree.get_children())
@@ -1201,9 +1325,33 @@ class App(tk.Tk):
 
     def start_download(self, rom, destination, choose_filename=False):
         folder = destination if choose_filename else destination.parent
+        if any(job.rom.url == rom.url and job.status in {"Queued", "Downloading", "Canceling"}
+               for job in self.jobs):
+            messagebox.showinfo("Already queued", f"{rom.name} is already in the download queue.", parent=self)
+            return
+        if not choose_filename and destination.exists():
+            messagebox.showerror(
+                "File already exists",
+                f"{destination} already exists. Spine does not replace files. "
+                "Choose another name or folder.", parent=self,
+            )
+            return
+        free = free_space(folder)
+        if rom.size and free is not None and free < rom.size:
+            messagebox.showerror(
+                "Not enough space",
+                f"{rom.name} needs {rom.size / 1073741824:,.2f} GB, but that drive has "
+                f"{free / 1073741824:,.2f} GB free.", parent=self,
+            )
+            return
+        unverified = "" if rom.sha1 else (
+            "\n\nThis source publishes no checksum for this file, so Spine cannot confirm "
+            "it is the file that was listed."
+        )
         if not messagebox.askokcancel(
             "Confirm download",
-            f"Download {rom.name} to {destination}?\n\nContinue if you have permission to download this file.",
+            f"Download {rom.name} to {destination}?{unverified}"
+            "\n\nContinue if you have permission to download this file.",
             parent=self,
         ):
             self.download_status.set("Download canceled")
@@ -1363,7 +1511,8 @@ class App(tk.Tk):
                 target = folder / self.filename(file)
                 self.events.put((progress, f"Connecting to save {target.name}…"))
             try:
-                download(file, target, report, archive_cookie, cancel)
+                download(file, target, report, archive_cookie, cancel,
+                         lambda text: self.events.put((progress, text)))
             except HTTPError as exc:
                 if archive_cookie and exc.code in (401, 403):
                     raise ValueError(
@@ -1373,7 +1522,7 @@ class App(tk.Tk):
                 raise ValueError(f"Could not download {target.name}: HTTP {exc.code}") from exc
             except (OSError, ValueError) as exc:
                 raise ValueError(f"Could not save {target.name}: {exc}") from exc
-            checksum = "SHA-1 matched" if file.sha1 else "no checksum provided"
+            checksum = "SHA-1 matched" if file.sha1 else "not verified (the source publishes no checksum)"
             return "Completed", f"Saved to {target} • {checksum}", str(target)
 
         self.background(transfer, saved, failed, daemon=False)
