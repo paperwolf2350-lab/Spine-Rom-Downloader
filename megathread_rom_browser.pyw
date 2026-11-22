@@ -25,6 +25,9 @@ ROOT = "https://r-roms.gitlab.io/"
 ALL_PLATFORMS = "All indexed platforms"
 STATE_PATH = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Megathread ROM Browser"
 ARCHIVE = "https://archive.org"
+ZIP_ITEM = "ni-roms"
+ZIP_SCOPE = "roms/Nintendo - Game Boy.zip"
+ZIP_CATEGORY = "Game Boy ZIP (Internet Archive)"
 BLUE = "https://www.blueroms.ws"
 BLUE_SUFFIX = " (BlueRoms)"
 BLUE_PLATFORMS = {
@@ -213,6 +216,7 @@ class Rom:
     sha1: str
     locked: bool
     source: str = "Internet Archive"
+    archive_member: bool = False
 
 
 @lru_cache(maxsize=16)
@@ -245,6 +249,38 @@ def listed_files(identifier, scope):
             locked or entry.get("private") in (True, "true", "1"),
         ))
     return results
+
+
+def archive_members(archive, cookie="", extensions=EXTENSIONS):
+    prefix = urlsplit(archive.url).path.rstrip("/") + "/"
+    url = ARCHIVE + prefix
+    response = request(url, "archive", cookie) if cookie else request(url, "archive")
+    with response:
+        limit = 8 * 1024 * 1024
+        page = response.read(limit + 1)
+        if len(page) > limit:
+            raise ValueError("The ZIP member listing exceeds the size limit.")
+        base = response.url
+    members = {}
+    for href, label in Links(page.decode("utf-8", errors="replace")).links:
+        target = urlsplit(urljoin(base, href))
+        if target.netloc != "archive.org" or target.scheme != "https" or target.query:
+            continue
+        if not target.path.startswith(prefix):
+            continue
+        member = unquote(target.path[len(prefix):])
+        path = PurePosixPath(member)
+        if (path.is_absolute() or ".." in path.parts or "\\" in member
+                or path.suffix.lower() not in extensions or label != member):
+            continue
+        direct = url + quote(member, safe="")
+        members[direct] = asdict(Rom(
+            path.name, archive.name, direct, 0, "", archive.locked,
+            archive_member=True,
+        ))
+    if not members:
+        raise ValueError("Internet Archive returned no supported individual file links.")
+    return members
 
 
 def blue_links(url):
@@ -312,7 +348,17 @@ def resolve_blue(rom):
     return replace(rom, name=name, url=url)
 
 
-def download(rom, destination, progress, archive_cookie=''):
+class DownloadCanceled(Exception):
+    pass
+
+
+def check_cancel(cancel):
+    if cancel is not None and cancel.is_set():
+        raise DownloadCanceled("Canceled by user.")
+
+
+def download(rom, destination, progress, archive_cookie='', cancel=None):
+    check_cancel(cancel)
     written = 0
     digest = hashlib.sha1()
     service = "blue-file" if rom.source == "BlueRoms" else "archive"
@@ -328,6 +374,7 @@ def download(rom, destination, progress, archive_cookie=''):
             partial = Path(output.name)
             try:
                 while chunk := source.read(256 * 1024):
+                    check_cancel(cancel)
                     written += len(chunk)
                     if expected and written > expected:
                         raise ValueError("The download exceeds the listed file size.")
@@ -339,6 +386,7 @@ def download(rom, destination, progress, archive_cookie=''):
                 if rom.sha1 and digest.hexdigest() != rom.sha1:
                     raise ValueError("The file did not match the published SHA-1.")
                 output.close()
+                check_cancel(cancel)
                 os.rename(partial, destination)
             finally:
                 output.close()
@@ -443,6 +491,51 @@ def apply_theme(window):
     style.configure("TSeparator", background=BORDER)
 
 
+LIBRARY_PLATFORMS = {
+    "Arcade": "arcade", "Dreamcast": "dreamcast", "Game Boy Advance": "gba",
+    "Neo Geo": "neogeo", "Nintendo 3DS": "n3ds", "Nintendo 64": "n64",
+    "Nintendo DS": "nds", "Nintendo GameCube": "gc", "Nintendo Switch": "switch",
+    "Nintendo Wii": "wii", "Nintendo Wii U": "wiiu", "PlayStation": "psx",
+    "PlayStation 2": "ps2", "PlayStation 3": "ps3", "PlayStation 4": "ps4",
+    "PlayStation 5": "ps5", "PlayStation Portable": "psp", "PlayStation Vita": "psvita",
+    "Saturn": "saturn", "Super Nintendo": "snes", "Xbox": "xbox", "Xbox 360": "xbox360",
+}
+LIBRARY_EXTENSIONS = {
+    ".gb": "gb", ".gbc": "gbc", ".gba": "gba", ".nes": "nes", ".sfc": "snes",
+    ".smc": "snes", ".n64": "n64", ".z64": "n64", ".v64": "n64", ".nds": "nds",
+    ".3ds": "n3ds", ".cia": "n3ds", ".wua": "wiiu", ".wbfs": "wii",
+    ".a26": "atari2600", ".a52": "atari5200", ".a78": "atari7800",
+    ".sms": "mastersystem", ".gg": "gamegear", ".32x": "sega32x",
+}
+
+
+def library_destination(root, rom):
+    if rom.source == "BlueRoms":
+        folder = LIBRARY_PLATFORMS.get(rom.collection)
+        if rom.collection == "Mega Drive - Genesis":
+            matches = [name for name in ("megadrive", "genesis") if (root / name).is_dir()]
+            folder = matches[0] if len(matches) == 1 else None
+    else:
+        folder = LIBRARY_EXTENSIONS.get(PurePosixPath(rom.name).suffix.lower())
+        if rom.archive_member and rom.collection == ZIP_SCOPE:
+            folder = "gb"
+    if folder:
+        candidate = root / folder
+        if candidate.is_dir() and candidate.resolve().is_relative_to(root.resolve()):
+            return candidate
+    return root
+
+
+@dataclass
+class DownloadJob:
+    rom: Rom
+    destination: str
+    choose_filename: bool
+    status: str = "Queued"
+    detail: str = ""
+    saved_path: str = ""
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -456,7 +549,17 @@ class App(tk.Tk):
         self.index = []
         self.coverage = ""
         self.rows = {}
-        self.busy = False
+        self.jobs = [
+            DownloadJob(rom=Rom(**item["rom"]), **{key: value for key, value in item.items() if key != "rom"})
+            for item in load_state("downloads.json", [])
+        ]
+        for job in self.jobs:
+            if job.status in {"Queued", "Downloading", "Canceling"}:
+                job.status = "Interrupted"
+                job.detail = "The app closed before this download finished."
+        self.active_job = None
+        self.cancel_transfer = None
+        self.download_window = None
         self.archive_cookie = ''
         self.search = tk.StringVar()
         self.category = tk.StringVar(value=ALL_PLATFORMS)
@@ -492,6 +595,13 @@ class App(tk.Tk):
         self.account_status = tk.StringVar(value="Internet Archive · Signed out")
         ttk.Label(account_bar, textvariable=self.account_status,
                   style="Muted.TLabel").pack(side="left", padx=10)
+        self.library_label = tk.StringVar()
+        self.update_library_label()
+        library_bar = ttk.Frame(frame)
+        library_bar.pack(fill="x", pady=(8, 0))
+        ttk.Button(library_bar, text="ROM library…", command=self.choose_library).pack(side="left")
+        ttk.Label(library_bar, textvariable=self.library_label,
+                  style="Muted.TLabel").pack(side="left", padx=10)
         table = ttk.Frame(frame)
         table.pack(fill="both", expand=True, pady=(14, 7))
         self.tree = ttk.Treeview(table, columns=("file", "collection", "source", "size", "access"), show="headings", selectmode="browse")
@@ -514,13 +624,14 @@ class App(tk.Tk):
         self.sync_status = tk.StringVar()
         ttk.Label(frame, textvariable=self.sync_status, style="Muted.TLabel",
                   wraplength=620).pack(anchor="w")
-        self.download_button = ttk.Button(bottom, text="Download selected…",
+        self.download_button = ttk.Button(bottom, text="Queue download…",
                                           style="Primary.TButton", command=self.save)
         self.download_button.pack(side="right")
         self.archive_open_button = ttk.Button(bottom, text="Open on Archive.org",
                                              command=self.open_archive_item)
         self.archive_open_button.pack(side="right", padx=(8, 0))
-        ttk.Button(bottom, text="Catalog details…", command=self.show_catalog).pack(side="right", padx=8)
+        ttk.Button(bottom, text="Downloads…", command=self.show_downloads).pack(side="right", padx=8)
+        ttk.Button(frame, text="Catalog details…", command=self.show_catalog).pack(anchor="w", pady=(5, 0))
         ttk.Label(bottom, textvariable=self.download_status, style="Muted.TLabel",
                   wraplength=380).pack(side="left", fill="x", expand=True)
         self.enable_download()
@@ -530,17 +641,19 @@ class App(tk.Tk):
             self.reload()
 
     def destroy(self):
+        if self.cancel_transfer:
+            self.cancel_transfer.set()
         self.after_cancel(self.event_timer)
         super().destroy()
 
-    def background(self, job, success, error):
+    def background(self, job, success, error, *, daemon=True):
         def run():
             try:
                 result = job()
                 self.events.put((success, result))
             except Exception as exc:
                 self.events.put((error, str(exc)))
-        threading.Thread(target=run, daemon=True).start()
+        threading.Thread(target=run, daemon=daemon).start()
 
     def process_events(self):
         try:
@@ -557,8 +670,27 @@ class App(tk.Tk):
         self.sync_status.set("Reading the Megathread…")
         previous = self.catalog.copy()
 
+        archive_cookie = self.archive_cookie
+
         def scan():
+            metadata.cache_clear()
             failures = 0
+            self.events.put((self.sync_status.set, "Reading Internet Archive Game Boy ZIP…"))
+            zip_entry = previous.get(ZIP_CATEGORY, {}).copy()
+            try:
+                archive, = listed_files(ZIP_ITEM, ZIP_SCOPE)
+                members = archive_members(archive, archive_cookie)
+                zip_entry = {"items": {ZIP_ITEM: members}, "errors": [], "read": 1, "total": 1}
+            except (OSError, ValueError) as exc:
+                detail = str(exc)
+                if isinstance(exc, HTTPError) and exc.code in (401, 403) and not archive_cookie:
+                    detail = f"Internet Archive returned HTTP {exc.code}. Connect your account and refresh to try the ZIP listing."
+                zip_entry.update(errors=[detail], read=0, total=1)
+                failures += 1
+            zip_entry["checked"] = datetime.now().astimezone().isoformat(timespec="minutes")
+            previous[ZIP_CATEGORY] = zip_entry
+            self.events.put((self.update_catalog, (ZIP_CATEGORY, zip_entry)))
+            save_state("catalog.json", previous)
             blue_labels = {label for label in previous if label.endswith(BLUE_SUFFIX)}
             blue_issue = ""
             try:
@@ -595,7 +727,6 @@ class App(tk.Tk):
                 save_state("catalog.json", previous)
                 return f"Megathread refresh failed • {exc}{blue_issue}"
 
-            metadata.cache_clear()
             for number, (label, url) in enumerate(urls.items(), 1):
                 def progress(done, total):
                     caption = f"{number}/{len(urls)} • {label} • {done}/{total} Archive items read"
@@ -616,7 +747,7 @@ class App(tk.Tk):
                 entry["checked"] = datetime.now().astimezone().isoformat(timespec="minutes")
                 previous[label] = entry
                 self.events.put((self.update_catalog, (label, entry)))
-            current = urls.keys() | blue_labels
+            current = urls.keys() | blue_labels | {ZIP_CATEGORY}
             for label in previous.keys() - current:
                 self.events.put((self.update_catalog, (label, None)))
             save_state("catalog.json", {label: previous[label] for label in current})
@@ -691,8 +822,9 @@ class App(tk.Tk):
                 size = f"{rom.size / 1048576:,.1f} MB" if rom.size else "Unknown"
                 row = self.tree.insert("", "end", tags=("odd" if count % 2 else "even",), values=(
                     rom.name, rom.collection, rom.source, size,
-                    ("Check access" if self.archive_cookie else "Sign in")
-                    if rom.locked else ("Check link" if rom.source == "BlueRoms" else "Public")
+                    ("ZIP member" if rom.archive_member else "Check access") if rom.locked and self.archive_cookie
+                    else "Sign in" if rom.locked else "ZIP member" if rom.archive_member
+                    else "Check link" if rom.source == "BlueRoms" else "Public"
                 ))
                 self.rows[row] = rom
         if self.combo.cget("state") == "readonly":
@@ -751,16 +883,16 @@ class App(tk.Tk):
         self.archive_open_button.configure(
             state="normal" if rom and rom.source == "Internet Archive" else "disabled",
         )
-        self.download_button.configure(state="normal" if rom and (not rom.locked or self.archive_cookie) and not self.busy else "disabled")
+        self.download_button.configure(state="normal" if rom and (not rom.locked or self.archive_cookie) else "disabled")
 
     def save(self):
         rom = self.selected()
-        if not rom or (rom.locked and not self.archive_cookie) or self.busy:
+        if not rom or (rom.locked and not self.archive_cookie):
             return
         if rom.source == "BlueRoms":
             folder = filedialog.askdirectory(
                 parent=self, title="Choose where to save the ROM",
-                initialdir=self.download_folder(), mustexist=True,
+                initialdir=self.download_folder(rom), mustexist=True,
             )
             if not folder:
                 return
@@ -768,12 +900,50 @@ class App(tk.Tk):
         else:
             chosen = filedialog.asksaveasfilename(
                 parent=self, title="Save ROM", initialfile=self.filename(rom),
-                confirmoverwrite=False, initialdir=self.download_folder(),
+                confirmoverwrite=False, initialdir=self.download_folder(rom),
             )
             if chosen:
                 self.start_download(rom, Path(chosen))
 
-    def download_folder(self):
+    def update_library_label(self):
+        root = self.settings.get("library_root")
+        self.library_label.set(f"ROM library · {root}" if root else "ROM library · Choose a folder to enable")
+
+    def choose_library(self):
+        root = self.settings.get("library_root")
+        if root:
+            choice = messagebox.askyesnocancel(
+                "ROM library", "Choose Yes to change the library or No to disconnect it.",
+                parent=self,
+            )
+            if choice is None:
+                return
+            if not choice:
+                self.settings.pop("library_root", None)
+                self.save_library()
+                return
+        suggested = Path("D:/Roms")
+        initial = root if root and Path(root).is_dir() else (
+            str(suggested) if suggested.is_dir() else self.download_folder()
+        )
+        chosen = filedialog.askdirectory(
+            parent=self, title="Choose the ROM library root", initialdir=initial, mustexist=True,
+        )
+        if chosen:
+            self.settings["library_root"] = chosen
+            self.save_library()
+
+    def save_library(self):
+        self.update_library_label()
+        try:
+            save_state("settings.json", self.settings)
+        except OSError as exc:
+            self.sync_status.set(f"Could not save ROM library setting • {exc}")
+
+    def download_folder(self, rom=None):
+        root = self.settings.get("library_root")
+        if root and Path(root).is_dir():
+            return str(library_destination(Path(root), rom)) if rom else root
         folder = self.settings.get("download_folder")
         return folder if folder and Path(folder).is_dir() else str(Path.home())
 
@@ -800,40 +970,146 @@ class App(tk.Tk):
             save_state("settings.json", self.settings)
         except OSError as exc:
             self.sync_status.set(f"Could not remember the download folder • {exc}")
-        self.busy = True
-        self.enable_download()
-        status = "Looking up BlueRoms file…" if choose_filename else "Connecting to Internet Archive…"
-        self.download_status.set(status)
+        self.jobs.append(DownloadJob(rom, str(destination), choose_filename))
+        self.update_downloads()
+        self.run_queue()
+
+    def update_downloads(self, persist=True):
+        if persist:
+            try:
+                retained = [job for job in self.jobs if job.status not in {"Queued", "Downloading", "Canceling"}][-100:]
+                pending = [job for job in self.jobs if job.status in {"Queued", "Downloading", "Canceling"}]
+                save_state("downloads.json", [asdict(job) for job in pending + retained])
+            except OSError as exc:
+                self.sync_status.set(f"Could not save download history • {exc}")
+        if self.download_window is None or not self.download_window.winfo_exists():
+            return
+        tree = self.download_tree
+        selected = tree.selection()
+        for row in tree.get_children():
+            tree.delete(row)
+        for index in range(len(self.jobs) - 1, -1, -1):
+            job = self.jobs[index]
+            tree.insert("", "end", iid=str(index), values=(job.rom.name, job.status, job.rom.source))
+        if selected and tree.exists(selected[0]):
+            tree.selection_set(selected[0])
+        self.update_download_details()
+
+    def show_downloads(self):
+        if self.download_window is not None and self.download_window.winfo_exists():
+            self.download_window.lift()
+            return
+        window = self.download_window = tk.Toplevel(self)
+        window.title("Downloads")
+        window.geometry("780x390")
+        window.minsize(520, 285)
+        window.configure(background=BACKGROUND)
+        frame = ttk.Frame(window, padding=16)
+        frame.pack(fill="both", expand=True)
+        tree = self.download_tree = ttk.Treeview(frame, columns=("file", "status", "source"),
+                                                 show="headings", selectmode="browse")
+        for column, label, width in (("file", "File or title", 430), ("status", "Status", 115), ("source", "Source", 125)):
+            tree.heading(column, text=label)
+            tree.column(column, width=width, stretch=column == "file")
+        scroll = ttk.Scrollbar(frame, command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        tree.pack(fill="both", expand=True)
+        tree.bind("<<TreeviewSelect>>", lambda _: self.update_download_details())
+        self.job_detail = tk.StringVar()
+        ttk.Label(frame, textvariable=self.job_detail, style="Muted.TLabel",
+                  wraplength=465).pack(anchor="w", pady=8)
+        controls = ttk.Frame(frame)
+        controls.pack(fill="x")
+        self.cancel_button = ttk.Button(controls, text="Cancel selected", command=self.cancel_job)
+        self.cancel_button.pack(side="left")
+        self.retry_button = ttk.Button(controls, text="Retry selected", command=self.retry_job)
+        self.retry_button.pack(side="left", padx=8)
+        self.update_downloads(persist=False)
+
+    def selected_job(self):
+        selected = self.download_tree.selection()
+        return self.jobs[int(selected[0])] if selected else None
+
+    def update_download_details(self):
+        job = self.selected_job()
+        self.job_detail.set((job.detail or job.destination) if job else "Select a download to see its details.")
+        self.cancel_button.configure(state="normal" if job and job.status in {"Queued", "Downloading"} else "disabled")
+        self.retry_button.configure(state="normal" if job and job.status in {"Failed", "Canceled", "Interrupted"} else "disabled")
+
+    def cancel_job(self):
+        job = self.selected_job()
+        if job and job.status == "Queued":
+            job.status, job.detail = "Canceled", "Canceled before the transfer began."
+        elif job is not None and job is self.active_job and job.status == "Downloading":
+            self.cancel_transfer.set()
+            job.status, job.detail = "Canceling", "Waiting for the current network read to finish."
+            self.download_status.set(job.detail)
+        self.update_downloads()
+
+    def retry_job(self):
+        job = self.selected_job()
+        if job and job.status in {"Failed", "Canceled", "Interrupted"}:
+            if job.rom.locked and not self.archive_cookie:
+                messagebox.showinfo("Internet Archive", "Connect Internet Archive before retrying this file.",
+                                    parent=self.download_window)
+                return
+            job.status, job.detail = "Queued", ""
+            self.update_downloads()
+            self.run_queue()
+
+    def run_queue(self):
+        if self.active_job is not None:
+            return
+        job = next((item for item in self.jobs if item.status == "Queued"), None)
+        if job is None:
+            return
+        rom, destination, choose_filename = job.rom, Path(job.destination), job.choose_filename
+        folder = destination if choose_filename else destination.parent
+        self.active_job = job
+        cancel = self.cancel_transfer = threading.Event()
+        job.status = "Downloading"
+        job.detail = "Looking up BlueRoms file…" if choose_filename else "Connecting to Internet Archive…"
+        self.download_status.set(job.detail)
+        self.update_downloads()
         archive_cookie = self.archive_cookie if rom.source == "Internet Archive" else ""
         last_update = float("-inf")
+
+        def progress(text):
+            if job.status == "Downloading":
+                job.detail = text
+                self.download_status.set(text)
+                if self.download_window is not None and self.download_window.winfo_exists():
+                    self.update_download_details()
 
         def report(written):
             nonlocal last_update
             now = monotonic()
             if now - last_update >= 0.25:
                 last_update = now
-                self.events.put((
-                    self.download_status.set, f"Received {written / 1048576:,.2f} MiB…",
-                ))
+                self.events.put((progress, f"{rom.name}: {written / 1048576:,.2f} MiB received"))
 
-        def finish(status):
-            self.busy = False
-            self.download_status.set(status)
-            self.enable_download()
+        def finish(status, detail, saved_path=""):
+            job.status, job.detail, job.saved_path = status, detail, saved_path
+            self.active_job = self.cancel_transfer = None
+            self.download_status.set(f"{status} • {rom.name}")
+            self.update_downloads()
+            self.run_queue()
 
-        def saved(status):
-            finish("Download complete")
-            messagebox.showinfo("Download complete", status, parent=self)
+        def saved(result):
+            status, detail, saved_path = result
+            finish(status, detail, saved_path)
 
         def failed(error):
-            finish("Download failed")
-            messagebox.showerror(
-                "Download failed",
-                f"{error}\n\nDestination folder: {folder}",
-                parent=self,
-            )
+            if cancel.is_set():
+                finish("Canceled", "Canceled by user.")
+            else:
+                finish("Failed", f"{error}\nDestination folder: {folder}")
 
         def transfer():
+            check_cancel(cancel)
+            if rom.locked and not archive_cookie:
+                raise ValueError("Connect Internet Archive and retry this file.")
             file = rom
             target = destination
             if choose_filename:
@@ -842,9 +1118,9 @@ class App(tk.Tk):
                 except (OSError, ValueError) as exc:
                     raise ValueError(f"BlueRoms link lookup failed: {exc}") from exc
                 target = folder / self.filename(file)
-                self.events.put((self.download_status.set, f"Connecting to save {target.name}…"))
+                self.events.put((progress, f"Connecting to save {target.name}…"))
             try:
-                download(file, target, report, archive_cookie)
+                download(file, target, report, archive_cookie, cancel)
             except HTTPError as exc:
                 if archive_cookie and exc.code in (401, 403):
                     raise ValueError(
@@ -855,9 +1131,9 @@ class App(tk.Tk):
             except (OSError, ValueError) as exc:
                 raise ValueError(f"Could not save {target.name}: {exc}") from exc
             checksum = "SHA-1 matched" if file.sha1 else "no checksum provided"
-            return f"Saved to {target} • {checksum}"
+            return "Completed", f"Saved to {target} • {checksum}", str(target)
 
-        self.background(transfer, saved, failed)
+        self.background(transfer, saved, failed, daemon=False)
 
 
 if __name__ == "__main__":
