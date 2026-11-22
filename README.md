@@ -13,6 +13,10 @@ Download and open [Spine-ROM-Browser.exe](Spine-ROM-Browser.exe) on 64-bit Windo
 3. Choose a platform category and search by filename, region, or collection. Click a column heading to sort by it. The list shows the first 500 matches; **Show 500 more** adds to it.
 4. Select a public result and choose **Queue download…** to save it. Hold Ctrl or Shift to select several and queue them into one folder with a single confirmation.
 
+### Build the .exe
+
+Double-click `build.bat`. It installs PyInstaller and writes `dist\Spine-ROM-Downloader.exe`. Python 3.11 or newer from python.org is required.
+
 ## Catalog coverage
 
 The app gets its collection links from the Megathread and uses Internet Archive's file listings. Locked files are marked in the results. Files inside a larger archive are searchable only if the host lists them individually.
