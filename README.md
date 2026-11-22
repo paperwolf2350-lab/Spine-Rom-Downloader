@@ -4,7 +4,7 @@ A Windows desktop app for searching Internet Archive collections linked by the [
 
 ## Run on Windows
 
-Download **Spine-ROM-Downloader.exe** from the [latest release](../../releases/latest) and open it on 64-bit Windows. The standalone build bundles Python and Tk.
+Download **Spine-ROM-Downloader.exe** and open it on 64-bit Windows. The standalone build bundles Python and Tk.
 
 ### Run from source
 
