@@ -1,4 +1,4 @@
-"""Search Internet Archive collections linked by the r/ROMs Megathread."""
+"""Spine ROM Downloader: search Internet Archive collections linked by the r/ROMs Megathread."""
 import hashlib
 import json
 import os
@@ -28,7 +28,22 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 ROOT = "https://r-roms.gitlab.io/"
 ALL_PLATFORMS = "All indexed platforms"
-STATE_PATH = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Megathread ROM Browser"
+APP_NAME = "Spine ROM Downloader"
+
+
+def state_folder():
+    """Where the app keeps its saved data. Carries over the folder from the old name."""
+    base = Path(os.environ.get("LOCALAPPDATA") or Path.home())
+    current, former = base / APP_NAME, base / "Megathread ROM Browser"
+    if former.is_dir() and not current.exists():
+        try:
+            former.rename(current)
+        except OSError:
+            return former
+    return current
+
+
+STATE_PATH = state_folder()
 ARCHIVE = "https://archive.org"
 ZIP_ITEM = "ni-roms"
 ZIP_SCOPE = "roms/Nintendo - Game Boy.zip"
@@ -85,7 +100,7 @@ def request(url, service, archive_cookie='', start=0):
         raise ValueError("URL is outside the approved hosts.")
     cookie = archive_cookie if service == "archive" else ""
     opener = build_opener(Redirects(service, cookie))
-    req = Request(url, headers={"User-Agent": "Megathread ROM Browser/0.1"})
+    req = Request(url, headers={"User-Agent": "Spine ROM Downloader/0.1"})
     if start:
         req.add_header("Range", f"bytes={start}-")
     if cookie:
@@ -773,6 +788,24 @@ def library_destination(root, rom):
     return root
 
 
+def library_names(root):
+    """Names (without the ending) of every file in the ROM library."""
+    names = set()
+    for _, _, files in os.walk(root):
+        for name in files:
+            names.add(os.path.splitext(name)[0].casefold())
+        if len(names) > 1_000_000:
+            break
+    return names
+
+
+COLUMNS = [
+    ("file", "File or title", 380), ("collection", "Collection", 195),
+    ("source", "Source", 130), ("size", "Size", 90), ("access", "Access", 95),
+]
+PAGE = 500
+
+
 @dataclass
 class DownloadJob:
     rom: Rom
@@ -787,7 +820,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         apply_theme(self)
-        self.title("Spine ROM Browser")
+        self.title(APP_NAME)
         self.geometry("1000x670")
         self.minsize(690, 440)
         self.events = SimpleQueue()
@@ -820,7 +853,7 @@ class App(tk.Tk):
         title.pack(anchor="w")
         title_font = ("Segoe UI", 22, "bold")
         ttk.Label(title, text="Spine", style="Accent.TLabel", font=title_font).pack(side="left")
-        ttk.Label(title, text=" ROM Browser", font=title_font).pack(side="left")
+        ttk.Label(title, text=" ROM Downloader", font=title_font).pack(side="left")
         ttk.Label(frame, text="Search by filename, region, or collection.",
                   style="Muted.TLabel").pack(anchor="w", pady=(3, 14))
         bar = ttk.Frame(frame)
@@ -850,14 +883,14 @@ class App(tk.Tk):
                   style="Muted.TLabel").pack(side="left", padx=10)
         table = ttk.Frame(frame)
         table.pack(fill="both", expand=True, pady=(14, 7))
-        self.tree = ttk.Treeview(table, columns=("file", "collection", "source", "size", "access"), show="headings", selectmode="browse")
-        for col, label, width in [
-            ("file", "File or title", 380), ("collection", "Collection", 195),
-            ("source", "Source", 130),
-            ("size", "Size", 90), ("access", "Access", 95),
-        ]:
-            self.tree.heading(col, text=label)
+        self.tree = ttk.Treeview(table, columns=("file", "collection", "source", "size", "access"), show="headings", selectmode="extended")
+        self.sort_column, self.sort_reverse = "file", False
+        self.limit = PAGE
+        self.owned_names = set()
+        for col, label, width in COLUMNS:
+            self.tree.heading(col, text=label, command=lambda col=col: self.sort_by(col))
             self.tree.column(col, width=width, stretch=col in {"file", "collection"})
+        self.show_sort()
         self.tree.tag_configure("even", background=SURFACE)
         self.tree.tag_configure("odd", background="#2d3039")
         scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
@@ -867,7 +900,10 @@ class App(tk.Tk):
         self.tree.bind("<<TreeviewSelect>>", lambda _: self.enable_download())
         self.search_timer = None
         self.search.trace_add("write", lambda *_: self.schedule_search())
-        ttk.Label(frame, textvariable=self.status, style="Muted.TLabel").pack(anchor="w")
+        status_row = ttk.Frame(frame)
+        status_row.pack(fill="x")
+        ttk.Label(status_row, textvariable=self.status, style="Muted.TLabel").pack(side="left")
+        self.more_button = ttk.Button(status_row, text=f"Show {PAGE} more", command=self.show_more)
         self.sync_status = tk.StringVar()
         ttk.Label(frame, textvariable=self.sync_status, style="Muted.TLabel",
                   wraplength=620).pack(anchor="w")
@@ -884,6 +920,7 @@ class App(tk.Tk):
         self.enable_download()
         self.event_timer = self.after(80, self.process_events)
         self.select_category()
+        self.scan_library()
         if STATE_NOTES:
             self.after(300, self.show_state_notes)
         if not self.catalog:
@@ -1163,47 +1200,90 @@ class App(tk.Tk):
             self.after_cancel(self.search_timer)
         self.search_timer = self.after(200, self.render)
 
+    def sort_by(self, column):
+        """Click a heading to sort by it; click again to reverse."""
+        if column == self.sort_column:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_column, self.sort_reverse = column, False
+        self.show_sort()
+        self.render()
+
+    def show_sort(self):
+        for col, label, _ in COLUMNS:
+            arrow = (" ▼" if self.sort_reverse else " ▲") if col == self.sort_column else ""
+            self.tree.heading(col, text=label + arrow)
+
+    def show_more(self):
+        self.limit += PAGE
+        self.render(keep_view=True)
+
+    def owned(self, rom):
+        return bool(self.owned_names) and Path(self.filename(rom)).stem.casefold() in self.owned_names
+
+    def access(self, rom):
+        if self.owned(rom):
+            return "In library"
+        if rom.locked:
+            if not self.archive_cookie:
+                return "Sign in"
+            return "ZIP member" if rom.archive_member else "Check access"
+        if rom.archive_member:
+            return "ZIP member"
+        return "Check link" if rom.source == "BlueRoms" else "Public"
+
     def render(self, keep_view=False):
-        """Fill the results list. keep_view keeps the selection and scroll position."""
+        """Fill the results list. keep_view keeps the selection, scroll position and length."""
         if self.search_timer is not None:
             self.after_cancel(self.search_timer)
             self.search_timer = None
-        chosen = self.selected() if keep_view else None
+        chosen = {rom.url for rom in self.selected_all()} if keep_view else set()
         top = self.tree.yview()[0] if keep_view else 0
+        if not keep_view:
+            self.limit = PAGE
         self.tree.delete(*self.tree.get_children())
         terms = self.search.get().casefold().split()
         self.rows.clear()
-        count = 0
-        reselect = None
-        for _, _, rom, searchable in self.index:
-            if not all(term in searchable for term in terms):
-                continue
-            count += 1
-            if count <= 500:
-                size = f"{rom.size / 1048576:,.1f} MB" if rom.size else "Unknown"
-                row = self.tree.insert("", "end", tags=("odd" if count % 2 else "even",), values=(
-                    rom.name, rom.collection, rom.source, size,
-                    ("ZIP member" if rom.archive_member else "Check access") if rom.locked and self.archive_cookie
-                    else "Sign in" if rom.locked else "ZIP member" if rom.archive_member
-                    else "Check link" if rom.source == "BlueRoms" else "Public"
-                ))
-                self.rows[row] = rom
-                if chosen is not None and rom.url == chosen.url:
-                    reselect = row
+        matches = [row[2] for row in self.index if all(term in row[3] for term in terms)]
+        if self.sort_column != "file":
+            key = {
+                "collection": lambda rom: rom.collection.casefold(),
+                "source": lambda rom: rom.source.casefold(),
+                "size": lambda rom: rom.size,
+                "access": self.access,
+            }[self.sort_column]
+            matches.sort(key=key, reverse=self.sort_reverse)
+        elif self.sort_reverse:
+            matches.reverse()
+        reselect = []
+        for number, rom in enumerate(matches[:self.limit], 1):
+            size = f"{rom.size / 1048576:,.1f} MB" if rom.size else "Unknown"
+            row = self.tree.insert("", "end", tags=("odd" if number % 2 else "even",), values=(
+                rom.name, rom.collection, rom.source, size, self.access(rom),
+            ))
+            self.rows[row] = rom
+            if rom.url in chosen:
+                reselect.append(row)
         if keep_view:
-            if reselect is not None:
+            if reselect:
                 self.tree.selection_set(reselect)
             self.tree.yview_moveto(top)
-        if self.combo.cget("state") == "readonly":
-            caption = f"{count:,} matches • {self.coverage}"
-            if count > 500:
-                caption += " • first 500 shown"
-            self.status.set(caption)
+        count = len(matches)
+        caption = f"{count:,} matches • {self.coverage}"
+        if count > self.limit:
+            caption += f" • first {self.limit:,} shown"
+            self.more_button.pack(side="left", padx=(10, 0))
+        else:
+            self.more_button.pack_forget()
+        self.status.set(caption)
         self.enable_download()
 
+    def selected_all(self):
+        return [self.rows[row] for row in self.tree.selection() if row in self.rows]
+
     def selected(self):
-        selected = self.tree.selection()
-        return self.rows.get(selected[0]) if selected else None
+        chosen = self.selected_all()
+        return chosen[0] if chosen else None
 
     def toggle_archive_account(self):
         if self.archive_cookie:
@@ -1245,17 +1325,29 @@ class App(tk.Tk):
             if match:
                 webbrowser.open(f"{ARCHIVE}/details/{match[1]}")
 
+    def downloadable(self, rom):
+        return not rom.locked or bool(self.archive_cookie)
+
     def enable_download(self):
-        rom = self.selected()
+        chosen = self.selected_all()
+        rom = chosen[0] if len(chosen) == 1 else None
         self.archive_open_button.configure(
             state="normal" if rom and rom.source == "Internet Archive" else "disabled",
         )
-        self.download_button.configure(state="normal" if rom and (not rom.locked or self.archive_cookie) else "disabled")
+        ready = sum(self.downloadable(rom) for rom in chosen)
+        self.download_button.configure(
+            state="normal" if ready else "disabled",
+            text=f"Queue {ready} downloads…" if ready > 1 else "Queue download…",
+        )
 
     def save(self):
-        rom = self.selected()
-        if not rom or (rom.locked and not self.archive_cookie):
+        roms = [rom for rom in self.selected_all() if self.downloadable(rom)]
+        if len(roms) > 1:
+            self.save_many(roms)
             return
+        if not roms:
+            return
+        rom = roms[0]
         if rom.source == "BlueRoms":
             folder = filedialog.askdirectory(
                 parent=self, title="Choose where to save the ROM",
@@ -1271,6 +1363,74 @@ class App(tk.Tk):
             )
             if chosen:
                 self.start_download(rom, Path(chosen))
+
+    def queued(self, rom):
+        return any(job.rom.url == rom.url and job.status in {"Queued", "Downloading", "Canceling"}
+                   for job in self.jobs)
+
+    def save_many(self, roms):
+        """Queue several files into one folder with a single confirmation."""
+        folder = filedialog.askdirectory(
+            parent=self, title=f"Choose where to save {len(roms)} files",
+            initialdir=self.download_folder(), mustexist=True,
+        )
+        if not folder:
+            return
+        folder = Path(folder)
+        root = self.settings.get("library_root")
+        try:
+            by_console = bool(root) and folder.resolve() == Path(root).resolve()
+        except OSError:
+            by_console = False
+        plan, skipped, taken = [], {}, set()
+        for rom in roms:
+            target = library_destination(folder, rom) if by_console else folder
+            choose_filename = rom.source == "BlueRoms"
+            destination = target if choose_filename else target / self.filename(rom)
+            if self.queued(rom):
+                reason = "already queued"
+            elif not choose_filename and destination.exists():
+                reason = "already saved there"
+            elif not choose_filename and str(destination).casefold() in taken:
+                reason = "same file name as another selected file"
+            else:
+                reason = ""
+            if reason:
+                skipped[reason] = skipped.get(reason, 0) + 1
+                continue
+            taken.add(str(destination).casefold())
+            plan.append((rom, destination, choose_filename))
+        notes = "".join(f"\n• {count} skipped: {reason}" for reason, count in skipped.items())
+        if not plan:
+            messagebox.showinfo("Nothing to queue", f"None of the selected files can be queued.{notes}", parent=self)
+            return
+        total = sum(rom.size for rom, _, _ in plan)
+        free = free_space(folder)
+        if total and free is not None and free < total:
+            messagebox.showerror(
+                "Not enough space",
+                f"These files need {total / 1073741824:,.2f} GB, but that drive has "
+                f"{free / 1073741824:,.2f} GB free.", parent=self,
+            )
+            return
+        size = f" ({total / 1073741824:,.2f} GB)" if total else ""
+        where = f"{folder}, each in its console folder where one exists" if by_console else str(folder)
+        unverified = sum(not rom.sha1 for rom, _, _ in plan)
+        if unverified:
+            notes += f"\n• {unverified} cannot be verified: the source publishes no checksum"
+        if not messagebox.askokcancel(
+            "Confirm downloads",
+            f"Queue {len(plan)} files{size} into {where}?{notes}"
+            "\n\nContinue if you have permission to download these files.",
+            parent=self,
+        ):
+            self.download_status.set("Download canceled")
+            return
+        self.remember_folder(folder)
+        for rom, destination, choose_filename in plan:
+            self.jobs.append(DownloadJob(rom, str(destination), choose_filename))
+        self.update_downloads()
+        self.run_queue()
 
     def update_library_label(self):
         root = self.settings.get("library_root")
@@ -1289,10 +1449,7 @@ class App(tk.Tk):
                 self.settings.pop("library_root", None)
                 self.save_library()
                 return
-        suggested = Path("D:/Roms")
-        initial = root if root and Path(root).is_dir() else (
-            str(suggested) if suggested.is_dir() else self.download_folder()
-        )
+        initial = root if root and Path(root).is_dir() else self.download_folder()
         chosen = filedialog.askdirectory(
             parent=self, title="Choose the ROM library root", initialdir=initial, mustexist=True,
         )
@@ -1300,8 +1457,23 @@ class App(tk.Tk):
             self.settings["library_root"] = chosen
             self.save_library()
 
+    def scan_library(self):
+        """Read the library's file names in the background to mark files already saved."""
+        root = self.settings.get("library_root")
+
+        def done(names):
+            if root == self.settings.get("library_root"):
+                self.owned_names = names
+                self.render(keep_view=True)
+
+        if root and Path(root).is_dir():
+            self.background(lambda: library_names(root), done, lambda error: None)
+        else:
+            done(set())
+
     def save_library(self):
         self.update_library_label()
+        self.scan_library()
         try:
             save_state("settings.json", self.settings)
         except OSError as exc:
@@ -1325,8 +1497,7 @@ class App(tk.Tk):
 
     def start_download(self, rom, destination, choose_filename=False):
         folder = destination if choose_filename else destination.parent
-        if any(job.rom.url == rom.url and job.status in {"Queued", "Downloading", "Canceling"}
-               for job in self.jobs):
+        if self.queued(rom):
             messagebox.showinfo("Already queued", f"{rom.name} is already in the download queue.", parent=self)
             return
         if not choose_filename and destination.exists():
@@ -1356,14 +1527,17 @@ class App(tk.Tk):
         ):
             self.download_status.set("Download canceled")
             return
+        self.remember_folder(folder)
+        self.jobs.append(DownloadJob(rom, str(destination), choose_filename))
+        self.update_downloads()
+        self.run_queue()
+
+    def remember_folder(self, folder):
         self.settings["download_folder"] = str(folder)
         try:
             save_state("settings.json", self.settings)
         except OSError as exc:
             self.sync_status.set(f"Could not remember the download folder • {exc}")
-        self.jobs.append(DownloadJob(rom, str(destination), choose_filename))
-        self.update_downloads()
-        self.run_queue()
 
     def update_downloads(self, persist=True):
         if persist:
@@ -1489,6 +1663,14 @@ class App(tk.Tk):
 
         def saved(result):
             status, detail, saved_path = result
+            root = self.settings.get("library_root")
+            try:
+                in_library = bool(root) and Path(saved_path).resolve().is_relative_to(Path(root).resolve())
+            except OSError:
+                in_library = False
+            if in_library:
+                self.owned_names.add(Path(saved_path).stem.casefold())
+                self.render(keep_view=True)
             finish(status, detail, saved_path)
 
         def failed(error):
@@ -1536,8 +1718,8 @@ if __name__ == "__main__":
         log_problem(traceback.format_exc())
         try:
             messagebox.showerror(
-                "Spine ROM Browser",
-                f"Spine ROM Browser could not start.\n\nDetails were saved to:\n{STATE_PATH / 'errors.log'}",
+                APP_NAME,
+                f"{APP_NAME} could not start.\n\nDetails were saved to:\n{STATE_PATH / 'errors.log'}",
             )
         except Exception:
             pass
