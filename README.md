@@ -1,6 +1,6 @@
 # Megathread ROM Browser
 
-A Windows desktop app for searching Internet Archive collections linked by the [r/ROMs Megathread](https://r-roms.gitlab.io/) and saving public files directly to your PC. It can be used alongside [Spine](https://github.com/paperwolf2350-lab/Spine).
+A Windows desktop app for searching Internet Archive collections linked by the [r/ROMs Megathread](https://r-roms.gitlab.io/) and saving public files directly to your PC. An experimental BlueRoms integration adds Game Boy Advance titles. It can be used alongside [Spine](https://github.com/paperwolf2350-lab/Spine).
 
 ## Run on Windows
 
@@ -17,6 +17,11 @@ Downloads use HTTPS, restrict redirects to approved Internet Archive hosts, and 
 
 ## Local catalog
 
-On first launch the app reads each Megathread category in the background. Search covers all indexed platforms by default, or you can select one category. Later launches open the saved catalog immediately. Use **Refresh catalog** to update it and **Catalog details** to see when each category was checked and which Archive items failed. If a previously indexed item fails during refresh, its cached listing stays searchable.
+On first launch the app reads each Megathread category in the background. Search covers all indexed platforms by default, or you can select one category. Later launches open the saved catalog immediately. Use **Refresh catalog** to update it and **Catalog details** to see when each category was checked and which listings failed. If a previously indexed item fails during refresh, its cached listing stays searchable.
 
 The app remembers the last confirmed download folder. Windows stores the catalog and folder preference under `%LOCALAPPDATA%\Megathread ROM Browser`.
+
+
+## BlueRoms pilot
+
+Select **Game Boy Advance (BlueRoms)** to explore just that catalog, or search all sources together. The **Source** column identifies each listing. BlueRoms links are resolved when you select a download, using the site's direct HTTPS file host. A title is listed before the app checks whether it has a supported direct file. The pilot supports titles with one direct file, and reports unavailable or ambiguous links in the app.

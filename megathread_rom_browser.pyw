@@ -7,7 +7,7 @@ import tempfile
 import threading
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from functools import lru_cache
 from html.parser import HTMLParser
@@ -21,6 +21,8 @@ ROOT = "https://r-roms.gitlab.io/"
 ALL_PLATFORMS = "All indexed platforms"
 STATE_PATH = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Megathread ROM Browser"
 ARCHIVE = "https://archive.org"
+BLUE = "https://www.blueroms.ws"
+BLUE_CATEGORY = "Game Boy Advance (BlueRoms)"
 EXTENSIONS = set(
     ".zip .7z .rar .iso .chd .rvz .wbfs .wua .cia .3ds .nds .gba .gbc .gb "
     ".nes .sfc .smc .n64 .z64 .v64 .bin .cue .gdi .cso .pbp .pce .a26 .a52 "
@@ -35,6 +37,10 @@ def trusted(url, service):
         return False
     if service == "guide":
         return host == "r-roms.gitlab.io"
+    if service == "blue":
+        return host == "www.blueroms.ws"
+    if service == "blue-file":
+        return host == "files.blueroms.ws"
     return host == "archive.org" or bool(re.fullmatch(
         r"ia[0-9]+\.(?:[a-z0-9-]+\.)?archive\.org", host
     ))
@@ -122,6 +128,7 @@ class Rom:
     size: int
     sha1: str
     locked: bool
+    source: str = "Internet Archive"
 
 
 @lru_cache(maxsize=16)
@@ -156,10 +163,65 @@ def listed_files(identifier, scope):
     return results
 
 
+def blue_links(url):
+    for href, label in Links(read(url, "blue").decode("utf-8")).links:
+        candidate = urljoin(url, href)
+        yield candidate, urlsplit(candidate).path, label
+
+
+def blue_catalog(progress):
+    next_page = f"{BLUE}/gba"
+    visited = set()
+    games = {}
+    while next_page and next_page not in visited and len(visited) < 100:
+        visited.add(next_page)
+        following = None
+        page_games = set()
+        for url, path, label in blue_links(next_page):
+            if not trusted(url, "blue"):
+                continue
+            if label and re.fullmatch(r"/game/gba/[^/]+/?", path):
+                game = BLUE + path.rstrip("/")
+                page_games.add(game)
+                games.setdefault(game, asdict(Rom(
+                    label, "Game Boy Advance", game, 0, "", False, "BlueRoms",
+                )))
+            if label in {"»", "Next", "Next »"} and path.rstrip("/") == "/gba" and urlsplit(url).query and url.split("#", 1)[0] != next_page:
+                following = url.split("#", 1)[0]
+        if not page_games:
+            raise ValueError("BlueRoms returned a catalog page with no GBA titles.")
+        next_page = following
+        progress(len(visited), len(games))
+    if next_page:
+        raise ValueError("BlueRoms pagination did not reach the end of the catalog.")
+    return {"gba": games}
+
+
+def resolve_blue(rom):
+    pages = {
+        url for url, path, label in blue_links(rom.url)
+        if trusted(url, "blue") and path.startswith("/download/") and label
+    }
+    if len(pages) != 1:
+        raise ValueError("BlueRoms did not expose a single download page for this game.")
+    files = {}
+    for url, path, label in blue_links(pages.pop()):
+        name = PurePosixPath(unquote(path)).name
+        if trusted(url, "blue-file") and PurePosixPath(name).suffix.lower() in EXTENSIONS:
+            files[url] = name
+        elif trusted(url, "blue-file") and PurePosixPath(label).suffix.lower() in EXTENSIONS:
+            files[url] = label
+    if len(files) != 1:
+        raise ValueError("BlueRoms did not expose a single supported direct file.")
+    url, name = files.popitem()
+    return replace(rom, name=name, url=url)
+
+
 def download(rom, destination, progress):
     written = 0
     digest = hashlib.sha1()
-    with request(rom.url, "archive") as source:
+    service = "blue-file" if rom.source == "BlueRoms" else "archive"
+    with request(rom.url, service) as source:
         if source.headers.get_content_type() in {"text/html", "application/json", "application/xhtml+xml"}:
             raise ValueError("The host returned a page instead of a file.")
         with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=".part", delete=False) as output:
@@ -262,9 +324,10 @@ class App(tk.Tk):
         ttk.Label(frame, text="Search by filename, region, or collection").pack(anchor="w")
         table = ttk.Frame(frame)
         table.pack(fill="both", expand=True, pady=8)
-        self.tree = ttk.Treeview(table, columns=("file", "collection", "size", "access"), show="headings", selectmode="browse")
+        self.tree = ttk.Treeview(table, columns=("file", "collection", "source", "size", "access"), show="headings", selectmode="browse")
         for col, label, width in [
-            ("file", "File", 430), ("collection", "Internet Archive collection", 280),
+            ("file", "File or title", 380), ("collection", "Collection", 195),
+            ("source", "Source", 130),
             ("size", "Size", 90), ("access", "Access", 95),
         ]:
             self.tree.heading(col, text=label)
@@ -287,7 +350,7 @@ class App(tk.Tk):
         self.enable_download()
         self.event_timer = self.after(80, self.process_events)
         self.select_category()
-        if not self.catalog:
+        if BLUE_CATEGORY not in self.catalog:
             self.reload()
 
     def destroy(self):
@@ -319,11 +382,34 @@ class App(tk.Tk):
         previous = self.catalog.copy()
 
         def scan():
-            urls = categories()
-            if not urls:
-                raise ValueError("No platform categories found.")
-            metadata.cache_clear()
             failures = 0
+            checked = datetime.now().astimezone().isoformat(timespec="minutes")
+
+            def blue_progress(pages, titles):
+                caption = f"BlueRoms • {pages} pages read • {titles} GBA titles"
+                self.events.put((self.sync_status.set, caption))
+
+            try:
+                items = blue_catalog(blue_progress)
+                blue = {"items": items, "errors": [], "read": 1, "total": 1}
+            except (OSError, ValueError) as exc:
+                blue = previous.get(BLUE_CATEGORY, {}).copy()
+                blue.update(errors=[str(exc)], read=0, total=1)
+                failures += 1
+            blue["checked"] = checked
+            previous[BLUE_CATEGORY] = blue
+            self.events.put((self.update_catalog, (BLUE_CATEGORY, blue)))
+
+            try:
+                urls = categories()
+                if not urls:
+                    raise ValueError("No platform categories found.")
+            except (OSError, ValueError) as exc:
+                save_state("catalog.json", previous)
+                blue_status = "unavailable" if blue["errors"] else "updated"
+                return f"BlueRoms {blue_status} • Megathread refresh failed • {exc}"
+
+            metadata.cache_clear()
             for number, (label, url) in enumerate(urls.items(), 1):
                 def progress(done, total):
                     caption = f"{number}/{len(urls)} • {label} • {done}/{total} Archive items read"
@@ -344,10 +430,11 @@ class App(tk.Tk):
                 entry["checked"] = datetime.now().astimezone().isoformat(timespec="minutes")
                 previous[label] = entry
                 self.events.put((self.update_catalog, (label, entry)))
-            for label in previous.keys() - urls.keys():
+            current = urls.keys() | {BLUE_CATEGORY}
+            for label in previous.keys() - current:
                 self.events.put((self.update_catalog, (label, None)))
-            save_state("catalog.json", {label: previous[label] for label in urls})
-            return f"Refresh complete • {len(urls)} categories checked • {failures} with gaps"
+            save_state("catalog.json", {label: previous[label] for label in current})
+            return f"Refresh complete • {len(current)} categories checked • {failures} with gaps"
 
         def finish(status):
             self.refresh.configure(state="normal")
@@ -379,7 +466,7 @@ class App(tk.Tk):
             key=lambda rom: (rom.name.casefold(), rom.url),
         )
         self.coverage = f"{len(self.catalog)} categories checked" if selected == ALL_PLATFORMS else (
-            f"{self.catalog[selected]['read']}/{self.catalog[selected]['total']} Archive items read on last refresh"
+            f"{self.catalog[selected]['read']}/{self.catalog[selected]['total']} listings read on last refresh"
         )
         self.render()
 
@@ -407,14 +494,15 @@ class App(tk.Tk):
         self.rows.clear()
         count = 0
         for rom in self.index:
-            searchable = f"{rom.name} {rom.collection}".casefold()
+            searchable = f"{rom.name} {rom.collection} {rom.source}".casefold()
             if not all(term in searchable for term in terms):
                 continue
             count += 1
             if count <= 500:
                 size = f"{rom.size / 1048576:,.1f} MB" if rom.size else "Unknown"
                 row = self.tree.insert("", "end", values=(
-                    rom.name, rom.collection, size, "Locked" if rom.locked else "Public"
+                    rom.name, rom.collection, rom.source, size,
+                    "Locked" if rom.locked else ("Check link" if rom.source == "BlueRoms" else "Public")
                 ))
                 self.rows[row] = rom
         if self.combo.cget("state") == "readonly":
@@ -436,6 +524,28 @@ class App(tk.Tk):
         rom = self.selected()
         if not rom or rom.locked or self.busy:
             return
+        if rom.source == "BlueRoms":
+            self.busy = True
+            self.enable_download()
+            self.download_status.set("Looking up BlueRoms download…")
+
+            def ready(file):
+                self.busy = False
+                self.download_status.set("")
+                self.enable_download()
+                self.choose_destination(file)
+
+            def failed(error):
+                self.busy = False
+                self.enable_download()
+                self.download_status.set("BlueRoms link unavailable")
+                messagebox.showerror("Could not find download", error)
+
+            self.background(lambda: resolve_blue(rom), ready, failed)
+        else:
+            self.choose_destination(rom)
+
+    def choose_destination(self, rom):
         name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", PurePosixPath(rom.name).name).rstrip(". ")
         if PureWindowsPath(name).is_reserved():
             name = "_" + name
